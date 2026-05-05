@@ -74,6 +74,33 @@ REGISTER_COMMAND(lxmf_send_opportunistic, {
     return bridge::json{{"message_hash", bridge::to_hex(from_rns(hash))}};
 })
 
+REGISTER_COMMAND(lxmf_send_direct, {
+    auto& rt = bridge::Runtime::instance();
+    auto dest_hash = bridge::hex_param(p, "destination_hash");
+    std::string content = bridge::str_param(p, "content");
+    std::string title = bridge::str_param_or(p, "title", "");
+    auto hash = rt.send_direct(to_rns(dest_hash), content, title);
+    return bridge::json{{"message_hash", bridge::to_hex(from_rns(hash))}};
+})
+
+REGISTER_COMMAND(lxmf_send_propagated, {
+    auto& rt = bridge::Runtime::instance();
+    auto dest_hash = bridge::hex_param(p, "destination_hash");
+    std::string content = bridge::str_param(p, "content");
+    std::string title = bridge::str_param_or(p, "title", "");
+    auto hash = rt.send_propagated(to_rns(dest_hash), content, title);
+    return bridge::json{{"message_hash", bridge::to_hex(from_rns(hash))}};
+})
+
+REGISTER_COMMAND(lxmf_set_outbound_propagation_node, {
+    auto& rt = bridge::Runtime::instance();
+    auto node_hash = bridge::hex_param(p, "destination_hash");
+    int stamp_cost = bridge::int_param_or(p, "stamp_cost", 0);
+    rt.set_outbound_propagation_node(to_rns(node_hash),
+                                     static_cast<uint8_t>(stamp_cost));
+    return bridge::json::object();
+})
+
 REGISTER_COMMAND(lxmf_get_received_messages, {
     auto& rt = bridge::Runtime::instance();
     uint64_t since_seq = bridge::int_param_or(p, "since_seq", 0);

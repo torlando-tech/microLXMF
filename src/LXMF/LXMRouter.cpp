@@ -599,8 +599,18 @@ void LXMRouter::process_outbound() {
 			return;
 		}
 
-		// Determine delivery method based on message size (LoRa-constrained threshold)
-		bool use_opportunistic = (message.packed_size() <= Type::Constants::LORA_ENCRYPTED_PACKET_MDU);
+		// Pyxis-style auto-select: small messages default to OPPORTUNISTIC
+		// (single-packet, LoRa-friendly) unless the caller explicitly
+		// asked for DIRECT or PROPAGATED. The python LXMF reference
+		// always respects desired_method, so the conformance bridge
+		// needs us to honor it too — without this check, lxmf_send_direct
+		// silently downgrades to OPPORTUNISTIC for any message under
+		// 159 bytes.
+		bool desired_is_direct = (message.method() == Type::Message::DIRECT) ||
+		                         (message.method() == Type::Message::PROPAGATED);
+		bool use_opportunistic =
+		    !desired_is_direct &&
+		    (message.packed_size() <= Type::Constants::LORA_ENCRYPTED_PACKET_MDU);
 
 		if (use_opportunistic) {
 			// OPPORTUNISTIC delivery - send as single encrypted packet

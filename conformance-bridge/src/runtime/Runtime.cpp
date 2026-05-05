@@ -176,14 +176,19 @@ void Runtime::announce() {
     _router->announce();
 }
 
-Bytes Runtime::send_opportunistic(const Bytes& dest_hash,
-                                  const std::string& content,
-                                  const std::string& title) {
-    if (!_router) throw std::runtime_error("LXMRouter not initialized");
-
-    // Look up recipient identity if known. For OPPORTUNISTIC, LXMessage's
-    // "from hashes" constructor is sufficient — the router will route by
-    // path table.
+// Common helper — build, pack, queue an LXMessage via the router. Returns
+// the message hash so command handlers can echo it back.
+static Bytes send_message_internal(
+    LXMF::LXMRouter& router,
+    const Identity& self_identity,
+    const Bytes& dest_hash,
+    const std::string& content,
+    const std::string& title,
+    const Runtime::FieldList& fields,
+    LXMF::Type::Message::Method method,
+    std::mutex& outbound_mutex,
+    std::map<Bytes, LXMF::Type::Message::State>& outbound_states)
+{
     Identity recipient_identity = Identity::recall(dest_hash);
     Destination dest{RNS::Type::NONE};
     if (recipient_identity) {
@@ -194,22 +199,61 @@ Bytes Runtime::send_opportunistic(const Bytes& dest_hash,
     Bytes content_b{(const uint8_t*)content.data(), content.size()};
     Bytes title_b{(const uint8_t*)title.data(), title.size()};
 
-    // Use the LXMRouter's already-registered IN delivery destination as
-    // the source — constructing a fresh one here would double-register.
-    LXMF::LXMessage m(dest, _router->delivery_destination(), content_b,
-                      title_b, LXMF::Type::Message::OPPORTUNISTIC);
+    LXMF::LXMessage m(dest, router.delivery_destination(), content_b,
+                      title_b, method);
     if (!dest) {
-        m = LXMF::LXMessage(dest_hash, _identity.hash(), content_b, title_b,
-                            LXMF::Type::Message::OPPORTUNISTIC);
+        // Recall miss — use hash-mode constructor; router will route via
+        // path table once available.
+        m = LXMF::LXMessage(dest_hash, self_identity.hash(), content_b,
+                            title_b, method);
+    }
+    for (const auto& kv : fields) {
+        m.fields_set(kv.first, kv.second);
     }
     m.pack();
     Bytes hash = m.hash();
     {
-        std::lock_guard<std::mutex> g(_outbound_mutex);
-        _outbound_states[hash] = LXMF::Type::Message::OUTBOUND;
+        std::lock_guard<std::mutex> g(outbound_mutex);
+        outbound_states[hash] = LXMF::Type::Message::OUTBOUND;
     }
-    _router->handle_outbound(m);
+    router.handle_outbound(m);
     return hash;
+}
+
+Bytes Runtime::send_opportunistic(const Bytes& dest_hash,
+                                  const std::string& content,
+                                  const std::string& title,
+                                  const FieldList& fields) {
+    if (!_router) throw std::runtime_error("LXMRouter not initialized");
+    return send_message_internal(*_router, _identity, dest_hash, content, title,
+                                 fields, LXMF::Type::Message::OPPORTUNISTIC,
+                                 _outbound_mutex, _outbound_states);
+}
+
+Bytes Runtime::send_direct(const Bytes& dest_hash,
+                           const std::string& content,
+                           const std::string& title,
+                           const FieldList& fields) {
+    if (!_router) throw std::runtime_error("LXMRouter not initialized");
+    return send_message_internal(*_router, _identity, dest_hash, content, title,
+                                 fields, LXMF::Type::Message::DIRECT,
+                                 _outbound_mutex, _outbound_states);
+}
+
+Bytes Runtime::send_propagated(const Bytes& dest_hash,
+                               const std::string& content,
+                               const std::string& title,
+                               const FieldList& fields) {
+    if (!_router) throw std::runtime_error("LXMRouter not initialized");
+    return send_message_internal(*_router, _identity, dest_hash, content, title,
+                                 fields, LXMF::Type::Message::PROPAGATED,
+                                 _outbound_mutex, _outbound_states);
+}
+
+void Runtime::set_outbound_propagation_node(const Bytes& node_hash, uint8_t stamp_cost) {
+    if (!_router) throw std::runtime_error("LXMRouter not initialized");
+    _router->set_outbound_propagation_node(node_hash);
+    _router->set_outbound_propagation_stamp_cost(stamp_cost);
 }
 
 std::vector<Runtime::ReceivedMsg> Runtime::get_received_messages(
@@ -257,7 +301,12 @@ void Runtime::on_delivery(LXMF::LXMessage& msg) {
         const Bytes& c = msg.content();
         rm.content = std::string((const char*)c.data(), c.size());
     }
-    rm.method = "opportunistic";  // Phase-1 only supports opportunistic
+    switch (msg.method()) {
+        case LXMF::Type::Message::OPPORTUNISTIC: rm.method = "opportunistic"; break;
+        case LXMF::Type::Message::DIRECT:        rm.method = "direct";        break;
+        case LXMF::Type::Message::PROPAGATED:    rm.method = "propagated";    break;
+        case LXMF::Type::Message::PAPER:         rm.method = "paper";         break;
+    }
     rm.ack_status = "received";
     rm.received_at_ms = (uint64_t)(Utilities::OS::time() * 1000.0);
 

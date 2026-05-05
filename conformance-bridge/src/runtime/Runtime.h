@@ -65,11 +65,29 @@ public:
     void add_tcp_client_interface(const std::string& name,
                                   const std::string& host, int port);
 
-    // LXMF actions.
+    // LXMF actions. `fields` is a vector of (key, value) byte pairs —
+    // the bridge protocol's wire-level fields representation. Empty for
+    // simple messages.
+    using FieldList = std::vector<std::pair<RNS::Bytes, RNS::Bytes>>;
+
     void announce();
     RNS::Bytes send_opportunistic(const RNS::Bytes& dest_hash,
                                   const std::string& content,
-                                  const std::string& title);
+                                  const std::string& title,
+                                  const FieldList& fields = {});
+    RNS::Bytes send_direct(const RNS::Bytes& dest_hash,
+                           const std::string& content,
+                           const std::string& title,
+                           const FieldList& fields = {});
+    RNS::Bytes send_propagated(const RNS::Bytes& dest_hash,
+                               const std::string& content,
+                               const std::string& title,
+                               const FieldList& fields = {});
+
+    // Phase-1 propagation helpers. The bridge harness configures an
+    // outbound propagation node via these before sending PROPAGATED
+    // messages.
+    void set_outbound_propagation_node(const RNS::Bytes& node_hash, uint8_t stamp_cost);
 
     // Inbound queue.
     std::vector<ReceivedMsg> get_received_messages(uint64_t since_seq,
