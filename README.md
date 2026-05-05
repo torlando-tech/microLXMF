@@ -13,14 +13,13 @@ Bootstrap. Sources extracted from [pyxis](https://github.com/torlando-tech/pyxis
 ```
 microLXMF/
 ├── src/
-│   ├── LXMF/                # public C++ API
-│   │   ├── LXMessage.{h,cpp}
-│   │   ├── LXMRouter.{h,cpp}
-│   │   ├── LXStamper.{h,cpp}
-│   │   ├── MessageStore.{h,cpp}
-│   │   ├── PropagationNodeManager.{h,cpp}
-│   │   └── Type.h
-│   └── platform/            # host/native shims for esp_task_wdt + freertos
+│   └── LXMF/                # public C++ API
+│       ├── LXMessage.{h,cpp}
+│       ├── LXMRouter.{h,cpp}
+│       ├── LXStamper.{h,cpp}
+│       ├── MessageStore.{h,cpp}
+│       ├── PropagationNodeManager.{h,cpp}
+│       └── Type.h
 ├── test/                    # PlatformIO native unit tests
 ├── conformance-bridge/      # JSON-RPC stdio bridge for lxmf-conformance
 └── library.json             # PlatformIO manifest
