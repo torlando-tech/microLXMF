@@ -1,0 +1,10 @@
+.pio/
+build/
+conformance-bridge/build/
+*.o
+*.a
+*.so
+.DS_Store
+.vscode/
+.idea/
+compile_commands.json

@@ -1,0 +1,46 @@
+{
+  "name": "microLXMF",
+  "version": "0.1.0",
+  "description": "C++ implementation of LXMF (Lightweight Extensible Message Format) layered on attermann/microReticulum. Sister library to LXMF-swift / LXMF-kt. Suitable for ESP32 and host (POSIX) targets.",
+  "keywords": "lxmf, reticulum, messaging, esp32, embedded",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/torlando-tech/microLXMF.git"
+  },
+  "authors": [
+    {
+      "name": "Torlando Tech LLC",
+      "url": "https://github.com/torlando-tech",
+      "maintainer": true
+    }
+  ],
+  "license": "MPL-2.0",
+  "frameworks": ["arduino", "*"],
+  "platforms": "*",
+  "dependencies": [
+    {
+      "name": "microReticulum",
+      "version": "https://github.com/attermann/microReticulum.git#0.3.0"
+    },
+    {
+      "name": "ArduinoJson",
+      "version": "^7.4.2"
+    }
+  ],
+  "build": {
+    "srcDir": "src",
+    "includeDir": "src",
+    "flags": [
+      "-Isrc",
+      "-Isrc/LXMF",
+      "-Isrc/platform"
+    ]
+  },
+  "export": {
+    "exclude": [
+      ".pio",
+      "build",
+      "conformance-bridge/build"
+    ]
+  }
+}
