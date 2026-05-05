@@ -8,3 +8,8 @@ conformance-bridge/build/
 .vscode/
 .idea/
 compile_commands.json
+# Bridge state files dropped during smoke testing
+conformance-bridge/identity
+conformance-bridge/transport_identity
+conformance-bridge/storage/
+conformance-bridge/cache/

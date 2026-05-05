@@ -6,13 +6,29 @@
 
 #include "bridge.h"
 
+#include <Log.h>
+
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
+// microReticulum and microLXMF log to a callback. Redirect everything to
+// stderr so it doesn't pollute the bridge's stdout JSON-RPC stream.
+static void log_to_stderr(const char* msg, RNS::LogLevel level) {
+    (void)level;
+    std::fprintf(stderr, "%s\n", msg);
+}
+
 int main() {
     std::ios::sync_with_stdio(false);
     std::cout.setf(std::ios::unitbuf);
+
+    RNS::set_log_callback(log_to_stderr);
+    // Default to ERROR-only on stderr — the conformance harness doesn't
+    // care about info/debug noise, and dumping every announce/packet
+    // through stderr makes pytest capture huge.
+    RNS::loglevel(RNS::LOG_ERROR);
 
     std::cout << "READY\n";
     std::cout.flush();
