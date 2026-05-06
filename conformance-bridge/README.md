@@ -4,17 +4,17 @@ JSON-RPC stdio bridge for [lxmf-conformance](https://github.com/torlando-tech/lx
 
 ## Status
 
-**16/25 conformance tests passing on the python↔microlxmf matrix** (4 cross-impl pairs each on announce + opportunistic + direct):
+**25/28 conformance tests passing on the python↔microlxmf matrix.** Only propagation tests failing — they require deeper Resource-transfer-to-lxmd protocol work that exceeds the basic Resource state machine.
 
 | Test suite | Results | Status |
 |---|---|---|
 | `test_announce_discovery` | **4/4 pass** | ✅ Wire-format parity for LXMF announces |
 | `test_opportunistic` | **4/4 pass** | ✅ Single-packet encrypt/decrypt + proof handling end-to-end |
 | `test_direct` | **4/4 pass** | ✅ Link establishment + small-msg link delivery + link proof |
-| `test_direct_large` | 1/4 pass | ⚠️ Resource transfer RX unimplemented in microReticulum |
-| `test_attachments` | 0/3 pass | ⚠️ LXMF wire format mismatch: fields stored as binary→binary instead of int→any |
-| `test_combined` | 0/3 pass | ⚠️ Hits both Resource RX + fields wire format gaps |
-| `test_propagation` | 0/3 pass | ⚠️ Resource upload to lxmd works; receiver sync hits Resource RX gap |
+| `test_direct_large` | **4/4 pass** | ✅ Resource transfer end-to-end (single-segment) |
+| `test_attachments` | **3/3 pass** | ✅ LXMF fields wire format (`dict[int, Any]`) round-trip |
+| `test_combined` | **3/3 pass** | ✅ Resource transfer + fields together |
+| `test_propagation` | 0/3 pass | ⚠️ Resource transfer to lxmd doesn't conclude — needs upstream propagation upload protocol debugging |
 
 Cross-impl matrix on the **announce + opportunistic + direct** surface beats the Swift bridge's reference Phase 1 status (the README at `lxmf-conformance` notes swift→python and swift→swift are still failing the same tests microlxmf passes here).
 
