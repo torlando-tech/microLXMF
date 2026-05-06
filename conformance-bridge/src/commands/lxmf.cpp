@@ -101,6 +101,19 @@ REGISTER_COMMAND(lxmf_set_outbound_propagation_node, {
     return bridge::json::object();
 })
 
+REGISTER_COMMAND(lxmf_request_path, {
+    auto& rt = bridge::Runtime::instance();
+    auto dest = bridge::hex_param(p, "destination_hash");
+    rt.request_path(to_rns(dest));
+    return bridge::json::object();
+})
+
+REGISTER_COMMAND(lxmf_has_path, {
+    auto& rt = bridge::Runtime::instance();
+    auto dest = bridge::hex_param(p, "destination_hash");
+    return bridge::json{{"has_path", rt.has_path(to_rns(dest))}};
+})
+
 REGISTER_COMMAND(lxmf_get_received_messages, {
     auto& rt = bridge::Runtime::instance();
     uint64_t since_seq = bridge::int_param_or(p, "since_seq", 0);

@@ -89,6 +89,10 @@ public:
     // messages.
     void set_outbound_propagation_node(const RNS::Bytes& node_hash, uint8_t stamp_cost);
 
+    // Path queries.
+    void request_path(const RNS::Bytes& destination_hash);
+    bool has_path(const RNS::Bytes& destination_hash);
+
     // Inbound queue.
     std::vector<ReceivedMsg> get_received_messages(uint64_t since_seq,
                                                    uint64_t& last_seq_out);

@@ -327,6 +327,16 @@ Bytes Runtime::send_propagated(const Bytes& dest_hash,
                                  _outbound_mutex, _outbound_states);
 }
 
+void Runtime::request_path(const Bytes& destination_hash) {
+    if (!_initialized.load()) throw std::runtime_error("Runtime not initialized");
+    Transport::request_path(destination_hash);
+}
+
+bool Runtime::has_path(const Bytes& destination_hash) {
+    if (!_initialized.load()) return false;
+    return Transport::has_path(destination_hash);
+}
+
 void Runtime::set_outbound_propagation_node(const Bytes& node_hash, uint8_t stamp_cost) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
     _router->set_outbound_propagation_node(node_hash);
