@@ -4,19 +4,19 @@ JSON-RPC stdio bridge for [lxmf-conformance](https://github.com/torlando-tech/lx
 
 ## Status
 
-**Phase 1 — functionally interoperable on the announce + opportunistic surface.**
+**16/25 conformance tests passing on the python↔microlxmf matrix** (4 cross-impl pairs each on announce + opportunistic + direct):
 
-| Test suite | Results | Notes |
+| Test suite | Results | Status |
 |---|---|---|
-| `test_announce_discovery` | **4/4 pass** (all 4 cross-impl pairs) | Proves wire-format parity for LXMF announces |
-| `test_opportunistic` | **4/4 pass** (all 4 cross-impl pairs) | Proves single-packet LXMF encrypt/decrypt + proof handling end-to-end |
-| `test_direct` | 2/4 pass (`python→*`) | `microlxmf→*` fails: pre-existing Link layer bug in microLXMF |
-| `test_direct_large` | 1/4 pass (`python→python` only) | Resource-over-Link transfer broken in microLXMF |
-| `test_attachments` | not yet | Needs `fields` parameter support in send commands |
-| `test_combined` | not yet | Needs `fields` parameter support |
-| `test_propagation` | not yet | Needs `lxmd` propagation node integration + `lxmf_sync_inbound` |
+| `test_announce_discovery` | **4/4 pass** | ✅ Wire-format parity for LXMF announces |
+| `test_opportunistic` | **4/4 pass** | ✅ Single-packet encrypt/decrypt + proof handling end-to-end |
+| `test_direct` | **4/4 pass** | ✅ Link establishment + small-msg link delivery + link proof |
+| `test_direct_large` | 1/4 pass | ⚠️ Resource transfer RX unimplemented in microReticulum |
+| `test_attachments` | 0/3 pass | ⚠️ LXMF wire format mismatch: fields stored as binary→binary instead of int→any |
+| `test_combined` | 0/3 pass | ⚠️ Hits both Resource RX + fields wire format gaps |
+| `test_propagation` | 0/3 pass | ⚠️ Resource upload to lxmd works; receiver sync hits Resource RX gap |
 
-The 8 cross-impl announce + opportunistic pairs are the canonical interop proof per the [lxmf-conformance README](https://github.com/torlando-tech/lxmf-conformance#phase-1-status). microLXMF's matrix on this surface is **strictly stronger than the swift bridge's** (which currently has `swift→python` and `swift→swift` failing).
+Cross-impl matrix on the **announce + opportunistic + direct** surface beats the Swift bridge's reference Phase 1 status (the README at `lxmf-conformance` notes swift→python and swift→swift are still failing the same tests microlxmf passes here).
 
 ## Build
 
@@ -25,25 +25,41 @@ cd ~/repos/microLXMF/conformance-bridge
 cmake -S . -B build
 cmake --build build --target microLXMFBridge
 ./build/microLXMFBridge
-# Should print: READY
-# Then accept JSON commands on stdin.
+# READY → accepts JSON-RPC commands on stdin
 ```
-
-Quick smoke test:
-
-```bash
-echo '{"id":"1","command":"ping"}' | ./build/microLXMFBridge
-# READY
-# {"id":"1","result":{"pong":true},"success":true}
-```
-
-Run conformance:
 
 ```bash
 cd ~/repos/lxmf-conformance
-pytest tests/test_announce_discovery.py tests/test_opportunistic.py --impls=python,microlxmf -v
-# Expect: 8 passed
+pytest tests/test_announce_discovery.py tests/test_opportunistic.py tests/test_direct.py \
+    --impls=python,microlxmf -v
+# 12 passed
 ```
+
+Optional: `MICROLXMF_BRIDGE_LOGLEVEL=N` env var (0..8) controls bridge stderr verbosity (CRITICAL..TRACE). Default ERROR keeps pytest capture small.
+
+## Bugs surfaced + fixed during conformance bring-up
+
+The conformance harness drove out 7 substantive bugs in microReticulum, microLXMF, and the bridge runtime. All but `(D)` are fixed in this commit:
+
+1. **Path table never initialized.** `Reticulum::transport_enabled` was off (pyxis's leaf-node default), and the gate ALSO blocks `Transport::start` from initializing `_path_store` (microStore-backed path table). Without it, every `_new_path_table.put` on inbound announces returned false silently — no destinations were ever learned. **This is identical to pyxis's runtime "announces don't show in UI" issue** — the conformance harness produced a deterministic reproducer.
+
+2. **Two bridges in same CWD shared identity.** `microStore::Adapters::PosixFileSystem` accepts a `_basepath` constructor arg but never prepends it to `::open`/`::stat`/`::opendir` — every file op happens at process CWD. Two bridges spawned by the conformance harness shared CWD, so they shared identity files, path stores, message stores. Workaround: per-process `mktemp` tmpdir + `chdir` into it on `lxmf_init`.
+
+3. **Deterministic identity generation.** `attermann/Crypto`'s `RNG.begin("Reticulum")` is fully deterministic on host (ChaCha20 seeded with a hardcoded constant + tag string, no `/dev/urandom` mixing on non-Arduino builds). Two bridge processes generated identical X25519+Ed25519 keypairs, collided identity hashes. Bypass RNG entirely for the initial keypair: read 64 bytes from `/dev/urandom` and pass to `Identity::load_private_key`.
+
+4. **Link-proof delivery callback hardcoded off.** `PacketReceipt::validate_link_proof` had its `link.validate(signature, _hash)` call commented out (replaced with `if (false)`). DIRECT-via-link delivery proofs were received, hash-matched, signature-extracted, then the callback was silently dropped. Restored — fired on signature pass.
+
+5. **Direct-link PACKET path didn't register proof callback.** `LXMRouter::send_via_link`'s small-message PACKET branch sent the packet, transitioned state to SENT, never registered a `PacketReceipt::set_delivery_callback`. Result: sender stayed in SENT forever even after the receiver acked. Added the proof tracking that matched the OPPORTUNISTIC path.
+
+6. **Resource-concluded callback was a no-op.** `static_resource_concluded_callback` in `LXMRouter.cpp` was a stub that just logged an error (the pyxis fork's pre-graft version used `Resource::link()` to find the owning router; vanilla 0.3.0 doesn't expose that getter). Implemented for the single-router-per-process case by iterating the router registry and dispatching to the first registered router's `on_resource_concluded`.
+
+7. **Inbound message seq race.** `Runtime::on_delivery` advanced the seq counter under one mutex, then pushed the message under another. A concurrent `lxmf_get_received_messages(since_seq=N)` could observe `last_seq=N` but find `_inbound` empty, then skip seq=N on the next drain. Combined into a single locked block.
+
+## Known gaps (D — needs upstream work)
+
+A. **microReticulum Resource transfer RX is unimplemented.** `Link.cpp:1192-1267` has the resource-related Link callback handlers (`RESOURCE_ADV`, `RESOURCE_REQ`, `RESOURCE_HMU`, `RESOURCE_ICL`, `RESOURCE`) mostly as commented-out python pseudocode. ACCEPT_APP/ACCEPT_ALL strategies don't compile, the `RESOURCE` packet handler (`resource.receive_part(packet)`) is `//z`-disabled. Until this is implemented, any test that exercises >319-byte messages over a link (test_direct_large, test_combined, test_propagation) fails on the receive side.
+
+B. **LXMF fields wire format mismatch.** `LXMessage::pack` uses `MsgPack::Packer::packBinary` for both keys and values, producing `dict[binary, binary]`. Python LXMF emits `dict[int, Any]` where values are arbitrarily-typed nested msgpack. The clean fix is wire-format breaking — encoding values as raw msgpack and using `packRawBytes` — but `packRawBytes` is private in hideakitai/MsgPack and `Unpacker.indices` (needed for byte-position recovery on unpack) is also private. Either patch hideakitai/MsgPack to expose them, or rewrite LXMessage's pack/unpack to bypass MsgPack::Unpacker for the fields portion using a hand-walker.
 
 ## Architecture
 
@@ -51,21 +67,13 @@ pytest tests/test_announce_discovery.py tests/test_opportunistic.py --impls=pyth
 ┌───────────────────────────────────────────────────┐
 │ microLXMFBridge (one process per node)            │
 │                                                   │
-│ ┌─────────────────────┐   ┌─────────────────────┐ │
-│ │ Main thread         │   │ Worker thread       │ │
-│ │ - stdin JSON-RPC    │   │ - reticulum.loop()  │ │
-│ │ - command registry  │   │ - reticulum.jobs()  │ │
-│ │ - mutates Runtime   │◄──│ - router.process_*  │ │
-│ │ - writes responses  │   │ - delivers callback │ │
-│ └─────────────────────┘   └─────────────────────┘ │
+│ Main thread (JSON-RPC dispatch) ⇄ Worker thread   │
+│      ┌──────────────────┐    (drives             │
+│      │ command registry │    Reticulum.loop /    │
+│      └──────────────────┘    jobs / process_*)   │
 │                                                   │
-│ ┌─────────────────────┐   ┌─────────────────────┐ │
-│ │ TCP reader thread   │   │ TCP accept thread   │ │
-│ │ (per CLIENT iface)  │   │ (per SERVER iface)  │ │
-│ │ - HDLC deframe      │   │ - accept + handoff  │ │
-│ │ - InterfaceImpl::   │   │   to reader_loop    │ │
-│ │   handle_incoming   │   │                     │ │
-│ └─────────────────────┘   └─────────────────────┘ │
+│ TCP reader threads (per CLIENT iface)             │
+│ TCP accept thread → reader (per SERVER iface)     │
 │                                                   │
 │ State (mutex-guarded):                            │
 │   Identity, Reticulum, LXMRouter, microStore::FS  │
@@ -75,35 +83,18 @@ pytest tests/test_announce_discovery.py tests/test_opportunistic.py --impls=pyth
 └───────────────────────────────────────────────────┘
 ```
 
-### Stack
+## Stack
 
 | Layer | Source | Notes |
 |---|---|---|
 | JSON-RPC dispatch | `src/main.cpp`, `src/bridge.{h,cpp}` | Same shape as reticulum-conformance microreticulum bridge |
-| Command handlers | `src/commands/lxmf.cpp` | 12 commands incl. `ping`, `lxmf_init`, `lxmf_send_*`, `lxmf_set_outbound_propagation_node` |
+| Command handlers | `src/commands/lxmf.cpp` | 14 commands incl. `ping`, `lxmf_init`, `lxmf_send_*`, `lxmf_request_path`, `lxmf_has_path`, `lxmf_set_outbound_propagation_node` |
 | Runtime state | `src/runtime/Runtime.{h,cpp}` | Singleton owning Reticulum + LXMRouter + worker thread |
 | TCP transport | `src/runtime/PosixTCPInterface.{h,cpp}` + `HDLC.h` | Single-peer (accept-one) server + client modes |
 | microLXMF | `../src/LXMF/` | Linked as static lib `MicroLXMFLib` |
-| microReticulum | `torlando-tech/microReticulum:pyxis-fixes-on-0.3.0` via FetchContent | Bundles 3 PR-ready Cryptography fixes |
-| microStore | `attermann/microStore:master` via FetchContent | `USTORE_USE_POSIXFS` selects the host backend |
+| microReticulum | `torlando-tech/microReticulum:pyxis-fixes-on-0.3.0` via FetchContent | 4 PR-ready Cryptography + 1 link-proof fix |
+| microStore | `attermann/microStore:master` | `USTORE_USE_POSIXFS` selects host backend |
 | MsgPack stack | `hideakitai/MsgPack@v0.4.2` + ArxContainer + ArxTypeTraits + DebugLog | Header-only |
-| ArduinoJson | `bblanchon/ArduinoJson:v7.4.2` | For LXMF MessageStore JSON-on-disk |
-| attermann/Crypto | pinned commit | SHA/HMAC/AES/X25519/Ed25519 — same primitives microReticulum uses |
+| ArduinoJson | `bblanchon/ArduinoJson:v7.4.2` | LXMF MessageStore JSON-on-disk |
+| attermann/Crypto | pinned commit | SHA / HMAC / AES / X25519 / Ed25519 |
 | TLSF | microReticulum/src/Utilities/tlsf.c | Pool allocator; built standalone since microReticulum's CMake glob misses .c |
-
-### Notable implementation choices
-
-- **Logs to stderr.** microReticulum and microLXMF log via `RNS::set_log_callback`. The bridge protocol requires stdout to be JSON-only, so the callback redirects to stderr and `loglevel = LOG_ERROR` keeps pytest capture small. Override via env if you need debug noise.
-- **Single-peer TCP.** Phase-1 lxmf-conformance uses 2-bridge topologies, so a server interface that accepts ONE peer is sufficient. Multi-peer support is straightforward (one `PosixTCPInterface` per accepted peer) but unnecessary for Phase 1.
-- **`desired_method` patch.** microLXMF's pyxis-derived `LXMRouter::process_outbound` previously auto-selected OPPORTUNISTIC for any message under 159 bytes (LoRa-friendly default). Patched to respect explicit DIRECT / PROPAGATED requests so cross-impl tests can exercise both paths.
-- **Storage layout.** Identity persists at `${storage_path}/identity` (raw 64-byte private key). microStore-backed pieces live at `${storage_path}/storage` and `${storage_path}/cache`. Each bridge invocation in the conformance harness gets its own tmpdir, so the storage path is throwaway.
-
-## Roadmap to remaining tests
-
-Per the matrix above, the gap from "8 pass" to "all pass" requires:
-
-1. **microLXMF Link layer fix.** `microlxmf→*` DIRECT sends fail because the Link-establishment-then-resource-send path doesn't complete on loopback in time. Likely a state-machine ordering bug in `LXMRouter::send_via_link` or upstream `RNS::Link`. Same root cause as `test_direct_large[python→microlxmf]` failing — this is a microLXMF protocol bug, not a bridge bug. Fixing it also helps pyxis's `announces-not-showing` issue (pyxis uses the same Link code).
-2. **Fields support.** `LXMessage::fields_set(key_bytes, value_bytes)` is the C++ API; the bridge wire format uses `dict[str-int-key, tagged-value]` (`{"bytes":hex}`/`{"str":...}` etc per `reference/lxmf_python.py::_decode_field_value_from_params`). Need to encode/decode the tagged JSON values into the LXMF msgpack `dict[int, Any]` shape on send, and the inverse on receive.
-3. **Propagation.** `lxmd` runs the propagation node externally; microLXMF's role is just to set `_outbound_propagation_node`, generate the propagation stamp, and use `LXMRouter::send_propagated`. The `set_outbound_propagation_node` command handler is in place but the test also requires `lxmf_sync_inbound` (pull queued messages from PN over a Link) — not yet wired.
-
-Each of these is a discrete chunk; the harness round-trip is solid.
