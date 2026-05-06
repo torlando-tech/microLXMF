@@ -575,9 +575,15 @@ void LXMRouter::process_outbound() {
 		}
 		message.increment_delivery_attempts();
 
-		// If propagation-only mode is enabled, send via propagation node
-		if (_propagation_only) {
-			DEBUG("  Using PROPAGATED delivery (propagation-only mode)");
+		// Route via propagation node when:
+		//   - propagation-only mode is enabled (router-level forced),
+		//   OR
+		//   - the caller explicitly requested PROPAGATED method via
+		//     lxmf_send_propagated. python LXMF dispatches per-message;
+		//     forcing propagation_only at the router level would lock
+		//     ALL messages to the PN.
+		if (_propagation_only || message.method() == Type::Message::PROPAGATED) {
+			DEBUG("  Using PROPAGATED delivery");
 			message.set_method(Type::Message::PROPAGATED);
 			if (send_propagated(message)) {
 				INFO("Message sent via PROPAGATED delivery");
