@@ -95,6 +95,25 @@ public:
     // messages.
     void set_outbound_propagation_node(const RNS::Bytes& node_hash, uint8_t stamp_cost);
 
+    // Pull queued messages from the configured propagation node. Blocks
+    // up to timeout_sec for the sync to reach a terminal state. Returns
+    // a final-state string ("complete", "failed", "timeout") plus the
+    // number of messages received. Delivered messages land in the
+    // regular inbound queue via the existing on_delivery callback.
+    struct SyncResult {
+        std::string final_state;
+        size_t messages_received = 0;
+    };
+    SyncResult sync_inbound(double timeout_sec);
+
+private:
+    // Set when sync_inbound is invoked from the bridge thread; the worker
+    // thread observes this and calls request_messages_from_propagation_node
+    // on its own thread (RNS Transport / Link mutations must occur on the
+    // same thread that drives Reticulum::loop()).
+    std::atomic<bool> _sync_request_pending{false};
+public:
+
     // Path queries.
     void request_path(const RNS::Bytes& destination_hash);
     bool has_path(const RNS::Bytes& destination_hash);

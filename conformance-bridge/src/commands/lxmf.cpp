@@ -127,6 +127,17 @@ REGISTER_COMMAND(lxmf_set_outbound_propagation_node, {
     return bridge::json::object();
 })
 
+REGISTER_COMMAND(lxmf_sync_inbound, {
+    auto& rt = bridge::Runtime::instance();
+    double timeout_sec = 30.0;
+    if (p.contains("timeout_sec")) timeout_sec = p["timeout_sec"].get<double>();
+    auto result = rt.sync_inbound(timeout_sec);
+    return bridge::json{
+        {"final_state", result.final_state},
+        {"messages_received", result.messages_received},
+    };
+})
+
 REGISTER_COMMAND(lxmf_request_path, {
     auto& rt = bridge::Runtime::instance();
     auto dest = bridge::hex_param(p, "destination_hash");

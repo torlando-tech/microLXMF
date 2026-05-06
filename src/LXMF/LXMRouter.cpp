@@ -586,14 +586,17 @@ void LXMRouter::process_outbound() {
 			DEBUG("  Using PROPAGATED delivery");
 			message.set_method(Type::Message::PROPAGATED);
 			if (send_propagated(message)) {
-				INFO("Message sent via PROPAGATED delivery");
-				if (_sent_callback) {
-					_sent_callback(message);
-				}
+				// Resource transfer to PN was initiated. Don't fire
+				// _sent_callback yet — python LXMF semantics: SENT
+				// means the PN actually received the upload (i.e. our
+				// Resource transfer concluded with PRF). The
+				// static_propagation_resource_concluded callback fires
+				// _sent_callback when that happens (LXMRouter.cpp).
+				// Until then leave message.state at OUTBOUND.
+				INFO("Message resource transfer to PN initiated, waiting for proof");
 				LXMessage dummy;
 				pending_outbound_pop(dummy);
 			} else {
-				// Propagation not ready yet - wait and retry
 				DEBUG("  Propagation delivery not ready, will retry...");
 				_next_outbound_process_time = now + OUTBOUND_RETRY_DELAY;
 			}

@@ -206,6 +206,10 @@ void Runtime::worker_loop() {
             if (_router) {
                 _router->process_outbound();
                 _router->process_inbound();
+                if (_sync_request_pending.exchange(false)) {
+                    _router->request_messages_from_propagation_node();
+                }
+                _router->process_sync();
             }
         } catch (const std::exception& e) {
             ERROR(std::string("Runtime worker loop exception: ") + e.what());
@@ -342,6 +346,38 @@ void Runtime::set_outbound_propagation_node(const Bytes& node_hash, uint8_t stam
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
     _router->set_outbound_propagation_node(node_hash);
     _router->set_outbound_propagation_stamp_cost(stamp_cost);
+}
+
+Runtime::SyncResult Runtime::sync_inbound(double timeout_sec) {
+    if (!_router) throw std::runtime_error("LXMRouter not initialized");
+
+    // Latch the result via the sync-complete callback. The router fires
+    // the callback exactly once on PR_COMPLETE; failures just leave the
+    // state at PR_FAILED, which we observe by polling.
+    std::atomic<size_t> received{0};
+    std::atomic<bool> completed{false};
+    _router->register_sync_complete_callback(
+        [&](size_t n) { received.store(n); completed.store(true); });
+
+    // Defer the actual request to the worker thread — the LXMRouter
+    // sync state machine touches RNS Transport / Link state that must
+    // be mutated on the loop thread.
+    _sync_request_pending.store(true);
+
+    using namespace std::chrono;
+    auto deadline = steady_clock::now() + duration_cast<steady_clock::duration>(
+        duration<double>(timeout_sec));
+    while (steady_clock::now() < deadline) {
+        auto st = _router->get_sync_state();
+        if (completed.load() || st == LXMF::LXMRouter::PR_COMPLETE) {
+            return {"complete", received.load()};
+        }
+        if (st == LXMF::LXMRouter::PR_FAILED) {
+            return {"failed", 0};
+        }
+        std::this_thread::sleep_for(milliseconds(50));
+    }
+    return {"timeout", received.load()};
 }
 
 std::vector<Runtime::ReceivedMsg> Runtime::get_received_messages(
