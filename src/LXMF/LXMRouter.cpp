@@ -245,23 +245,18 @@ static void static_delivery_link_established_callback(Link& link) {
 
 // Static callback for resource concluded on delivery links (receiving).
 //
-// Pre-graft: the fork's Resource exposed `link()` returning the Link the
-// resource was transferred over, used here to find the router that owns
-// the link's destination. Vanilla upstream microReticulum @ 0.3.0 doesn't
-// expose this getter — Resource is heavily refactored and Link tracking
-// is internal.
-//
-// SPIKE STATE: this callback is a no-op. Inbound RESOURCE-form LXMF
-// messages will not be dispatched to any router until either (a)
-// Resource::link() is restored on upstream, or (b) LXMF is ported to
-// upstream's new Resource API (which probably wires the link through
-// a different callback path). Tracked in
-// pyxis_microReticulum_graft_spike_findings.md.
+// Pre-graft this used Resource::link() to find the owning router; vanilla
+// 0.3.0 doesn't expose that getter. For the conformance bridge there is
+// exactly one router per process, so iterate the registry and dispatch.
+// Multi-router deployments will need a Resource::link() upstream patch.
 static void static_resource_concluded_callback(const Resource& resource) {
-	(void)resource;
-	ERROR("static_resource_concluded_callback: pyxis spike — Resource::link() "
-	      "not exposed on vanilla upstream microReticulum @ 0.3.0; "
-	      "resource-form delivery is currently disabled.");
+	for (size_t i = 0; i < ROUTER_REGISTRY_SIZE; i++) {
+		if (_router_registry_pool[i].in_use && _router_registry_pool[i].router) {
+			_router_registry_pool[i].router->on_resource_concluded(resource);
+			return;  // single-router assumption: deliver to first registered
+		}
+	}
+	WARNING("static_resource_concluded_callback: no registered router");
 }
 
 // Static callback for outbound resource concluded (sending)
@@ -1090,7 +1085,26 @@ bool LXMRouter::send_via_link(LXMessage& message, Link& link) {
 			INFO(buf);
 
 			Packet packet(link, message.packed());
-			packet.send();
+			PacketReceipt receipt = packet.send();
+
+			// Register proof callback so the sender's _delivered_callback
+			// fires once the receiver acknowledges. Without this hook the
+			// sender stays in SENT forever — same shape as the
+			// OPPORTUNISTIC path's proof tracking immediately above. The
+			// pyxis fork apparently never tested this branch end-to-end.
+			if (receipt) {
+				receipt.set_delivery_callback(static_proof_callback);
+				PendingProofSlot* slot = find_empty_pending_proof_slot();
+				if (slot) {
+					slot->in_use = true;
+					slot->set_packet_hash(receipt.hash());
+					slot->set_message_hash(message.hash());
+					snprintf(buf, sizeof(buf), "  Registered proof callback for direct-link packet %.16s...", receipt.hash().toHex().c_str());
+					DEBUG(buf);
+				} else {
+					WARNING("  Pending proofs pool full - cannot track DIRECT-link proof");
+				}
+			}
 
 			message.state(Type::Message::SENT);
 			INFO("Message sent successfully as packet");

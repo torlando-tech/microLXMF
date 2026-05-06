@@ -25,10 +25,15 @@ int main() {
     std::cout.setf(std::ios::unitbuf);
 
     RNS::set_log_callback(log_to_stderr);
-    // Default to ERROR-only on stderr — the conformance harness doesn't
-    // care about info/debug noise, and dumping every announce/packet
-    // through stderr makes pytest capture huge.
-    RNS::loglevel(RNS::LOG_ERROR);
+    // Default to ERROR-only on stderr. Bump via MICROLXMF_BRIDGE_LOGLEVEL
+    // env var (0=NONE, 1=CRITICAL, 2=ERROR, 3=WARNING, 4=NOTICE, 5=INFO,
+    // 6=VERBOSE, 7=DEBUG, 8=TRACE) to debug interop issues.
+    {
+        const char* env_level = std::getenv("MICROLXMF_BRIDGE_LOGLEVEL");
+        RNS::LogLevel lvl = RNS::LOG_ERROR;
+        if (env_level) lvl = static_cast<RNS::LogLevel>(std::atoi(env_level));
+        RNS::loglevel(lvl);
+    }
 
     std::cout << "READY\n";
     std::cout.flush();

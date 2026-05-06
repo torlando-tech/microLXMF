@@ -5,6 +5,9 @@
 #include <Destination.h>
 #include <Log.h>
 #include <Utilities/OS.h>
+#include <RNG.h>
+
+#include <fstream>
 
 #include <chrono>
 #include <stdexcept>
@@ -26,7 +29,23 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
     if (_initialized.load()) {
         throw std::runtime_error("Runtime already initialized");
     }
-    _storage_path = storage_path.empty() ? "./microlxmf-state" : storage_path;
+    if (storage_path.empty()) {
+        // Conformance harness invokes lxmf_init without a storage_path
+        // and both bridges run in the same CWD. PosixFileSystem doesn't
+        // honor its basepath argument either (every file op happens at
+        // CWD), so a shared default like "./microlxmf-state" causes the
+        // two bridges to share identity, path table, message store —
+        // collapsing the topology to a single virtual node. Default to a
+        // tmpdir keyed by pid so concurrent bridge processes never
+        // collide.
+        char tmp[256];
+        std::snprintf(tmp, sizeof(tmp), "/tmp/microlxmf-bridge-%d-XXXXXX", (int)getpid());
+        char* mk = mkdtemp(tmp);
+        if (!mk) throw std::runtime_error("Could not create per-bridge tmpdir");
+        _storage_path = mk;
+    } else {
+        _storage_path = storage_path;
+    }
     _display_name = display_name;
 
     // Make sure storage dirs exist (PosixFileSystem doesn't auto-mkdir).
@@ -36,15 +55,69 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
     std::string cache_dir = _storage_path + "/cache";
     ::mkdir(cache_dir.c_str(), 0700);
 
+    // microStore::Adapters::PosixFileSystem accepts a basepath in its
+    // constructor but does NOT prepend it to ::open/::stat/::opendir
+    // calls — every file op happens at the process CWD. The
+    // conformance harness spawns multiple bridges from the same CWD,
+    // so without chdir'ing they'd all share `identity`, persistent
+    // path tables, etc. Chdir into the per-bridge storage path so each
+    // process has its own filesystem-rooted view.
+    if (::chdir(_storage_path.c_str()) != 0) {
+        throw std::runtime_error("chdir into storage_path failed: " + _storage_path);
+    }
+
     {
-        microStore::Adapters::PosixFileSystem stack_fs(_storage_path.c_str());
+        microStore::Adapters::PosixFileSystem stack_fs(".");
         _fs = stack_fs;  // shared_ptr copy
     }
     Utilities::OS::register_filesystem(_fs);
 
     // Reticulum singleton — its constructor sets up RNG, paths.
     _reticulum.reset(new Reticulum());
-    Reticulum::transport_enabled(false);
+    // Enable transport mode. This is misleadingly named — it controls
+    // whether the path_store (microStore-backed path table) is
+    // initialized in Transport::start, NOT just whether we route for
+    // other peers. With transport_enabled=false (pyxis's default since
+    // pyxis is a leaf node), the path_store is never init'd and every
+    // call to _new_path_table.put returns false. That means the path
+    // table never learns from inbound announces, so DIRECT delivery
+    // can't find a peer's path and send_opportunistic also fails the
+    // recipient identity recall. The conformance bridge always needs
+    // its own path table populated, so we always enable it here.
+    Reticulum::transport_enabled(true);
+
+    // attermann/Crypto's RNG.begin() is fully deterministic on host:
+    // ChaCha20 seeded with a hardcoded constant + tag string "Reticulum".
+    // No /dev/urandom or platform-specific entropy is mixed in for non-
+    // Arduino builds, so every bridge process produces the SAME identity.
+    // Two bridges in the conformance harness then collide on identity hash,
+    // breaking opportunistic routing (everything routes locally instead
+    // of crossing the TCP link), DIRECT link establishment (you can't
+    // open a Link to your own destination), and propagation.
+    //
+    // RNG.stir() does mix entropy into the ChaCha state but downstream
+    // consumers may have already pulled bytes from RNG before stir takes
+    // effect. The robust fix: bypass the RNG entirely for the initial
+    // keypair by reading 64 bytes from /dev/urandom and using
+    // Identity::load_private_key (which sets X25519 + Ed25519 priv bytes
+    // directly without invoking RNG).
+    auto read_urandom = [](size_t n) -> Bytes {
+        Bytes out;
+        std::ifstream f("/dev/urandom", std::ios::binary);
+        if (!f) return out;
+        std::vector<uint8_t> buf(n);
+        f.read(reinterpret_cast<char*>(buf.data()), n);
+        if ((size_t)f.gcount() != n) return out;
+        out.assign(buf.data(), n);
+        return out;
+    };
+    // Stir RNG with 32 fresh bytes anyway so anything else that pulls
+    // from RNG (e.g. ephemeral X25519 in Identity::encrypt) is also
+    // de-collided.
+    {
+        Bytes seed = read_urandom(32);
+        if (seed.size() == 32) RNG.stir(seed.data(), 32, 256);
+    }
 
     // Identity. Try to load a saved one; on miss, generate.
     std::string ident_file = "identity";
@@ -62,9 +135,13 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
         _identity = Identity(false);
         _identity.load_private_key(priv);
     } else {
-        _identity = Identity();  // generates fresh key pair
-        const Bytes& pk = _identity.get_private_key();
-        Utilities::OS::write_file(ident_file.c_str(), pk);
+        Bytes priv_bytes = read_urandom(64);
+        if (priv_bytes.size() != 64) {
+            throw std::runtime_error("Failed to read 64 bytes from /dev/urandom");
+        }
+        _identity = Identity(false);
+        _identity.load_private_key(priv_bytes);
+        Utilities::OS::write_file(ident_file.c_str(), priv_bytes);
     }
 
     // Start Reticulum AFTER interfaces are added — but the router needs
@@ -288,10 +365,6 @@ Bytes Runtime::delivery_destination_hash() const {
 
 void Runtime::on_delivery(LXMF::LXMessage& msg) {
     ReceivedMsg rm;
-    {
-        std::lock_guard<std::mutex> g(_inbound_mutex);
-        rm.seq = ++_inbound_seq_counter;
-    }
     rm.message_hash = msg.hash();
     rm.source_hash = msg.source_hash();
     rm.destination_hash = msg.destination_hash();
@@ -310,7 +383,11 @@ void Runtime::on_delivery(LXMF::LXMessage& msg) {
     rm.ack_status = "received";
     rm.received_at_ms = (uint64_t)(Utilities::OS::time() * 1000.0);
 
+    // Advance seq + push under a SINGLE lock so a concurrent reader can't
+    // observe last_seq=N but find _inbound empty (causing it to skip
+    // seq=N on the next drain).
     std::lock_guard<std::mutex> g(_inbound_mutex);
+    rm.seq = ++_inbound_seq_counter;
     _inbound.push_back(std::move(rm));
 }
 
