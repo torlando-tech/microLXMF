@@ -95,6 +95,35 @@ target_include_directories(ReticulumStatic PUBLIC
 # and pick up the headers.
 target_include_directories(MsgPack INTERFACE ${msgpack_SOURCE_DIR})
 
+# Patch hideakitai/MsgPack to expose `packRawBytes` (private) and the
+# Unpacker's byte-position state (also private). LXMessage's fields map
+# uses `dict[int, Any]` on the wire — to splice arbitrary msgpack values
+# into the stream without LXMessage knowing the value type, we splice
+# pre-encoded bytes via packRawBytes; on decode we use Unpacker's
+# `indices` to capture each key+value byte span. The patch is
+# idempotent: only rewrites the modifiers when they're still default-
+# private from the upstream tag.
+if(EXISTS "${msgpack_SOURCE_DIR}/MsgPack/Packer.h")
+    file(READ "${msgpack_SOURCE_DIR}/MsgPack/Packer.h" _packer_content)
+    string(REPLACE
+        "    private:\n        void packRawByte"
+        "    public:  // patched by microLXMF conformance-bridge CMakeLists\n        void packRawByte"
+        _packer_patched "${_packer_content}")
+    if(NOT "${_packer_patched}" STREQUAL "${_packer_content}")
+        file(WRITE "${msgpack_SOURCE_DIR}/MsgPack/Packer.h" "${_packer_patched}")
+    endif()
+endif()
+if(EXISTS "${msgpack_SOURCE_DIR}/MsgPack/Unpacker.h")
+    file(READ "${msgpack_SOURCE_DIR}/MsgPack/Unpacker.h" _unpacker_content)
+    string(REPLACE
+        "    class Unpacker {\n        uint8_t* raw_data"
+        "    class Unpacker {\n    public:  // patched by microLXMF conformance-bridge CMakeLists\n        uint8_t* raw_data"
+        _unpacker_patched "${_unpacker_content}")
+    if(NOT "${_unpacker_patched}" STREQUAL "${_unpacker_content}")
+        file(WRITE "${msgpack_SOURCE_DIR}/MsgPack/Unpacker.h" "${_unpacker_patched}")
+    endif()
+endif()
+
 # microReticulum's CMakeLists glob is `src/*.cpp` — it misses tlsf.c (the
 # pool allocator backing RNS::Utilities::Memory). Compile it separately
 # and link into ReticulumStatic so the unresolved tlsf_* symbols disappear.
@@ -102,6 +131,16 @@ enable_language(C)
 add_library(TlsfLib STATIC ${microreticulum_SOURCE_DIR}/src/Utilities/tlsf.c)
 target_include_directories(TlsfLib PUBLIC ${microreticulum_SOURCE_DIR}/src/Utilities)
 target_link_libraries(ReticulumStatic PUBLIC TlsfLib)
+
+# bzip2 (libbz2) — vendored into microReticulum/lib/libbz2 alongside the
+# new Cryptography/BZ2 wrapper. Resource transfer uses bz2 to compress
+# payloads matching python LXMF's auto_compress path; without it the
+# receiver can't decode resources sent from python.
+file(GLOB BZ2_SOURCES ${microreticulum_SOURCE_DIR}/lib/libbz2/*.c)
+add_library(Bz2Lib STATIC ${BZ2_SOURCES})
+target_include_directories(Bz2Lib PUBLIC ${microreticulum_SOURCE_DIR}/lib/libbz2)
+target_compile_options(Bz2Lib PRIVATE -Wno-everything -DBZ_NO_STDIO)
+target_link_libraries(ReticulumStatic PUBLIC Bz2Lib)
 
 # Make microStore headers visible to microReticulum's translation units.
 target_include_directories(ReticulumStatic PUBLIC ${microstore_SOURCE_DIR}/include)

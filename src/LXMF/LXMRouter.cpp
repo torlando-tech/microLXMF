@@ -1282,6 +1282,9 @@ void LXMRouter::on_incoming_link_established(Link& link) {
 	link.set_packet_callback(static_link_packet_callback);
 	// Set up resource concluded callback for multi-packet LXMF messages
 	link.set_resource_concluded_callback(static_resource_concluded_callback);
+	// Without ACCEPT_ALL the link rejects every RESOURCE_ADV — the
+	// callback alone doesn't change strategy.
+	link.set_resource_strategy(RNS::Type::Link::ACCEPT_ALL);
 	DEBUG("  Packet and resource callbacks registered for incoming LXMF messages");
 }
 

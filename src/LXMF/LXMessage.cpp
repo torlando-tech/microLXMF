@@ -6,6 +6,7 @@
 #include <Resource.h>
 
 #include <MsgPack.h>
+#include <functional>
 
 using namespace LXMF;
 using namespace RNS;
@@ -145,8 +146,8 @@ const Bytes& LXMessage::pack() {
 	packer.packMapSize(_fields_count);
 	for (size_t i = 0; i < MAX_FIELDS; ++i) {
 		if (_fields_pool[i].in_use) {
-			packer.packBinary(_fields_pool[i].key.data(), _fields_pool[i].key.size());
-			packer.packBinary(_fields_pool[i].value.data(), _fields_pool[i].value.size());
+			packer.packRawBytes(_fields_pool[i].key.data(), _fields_pool[i].key.size());
+			packer.packRawBytes(_fields_pool[i].value.data(), _fields_pool[i].value.size());
 		}
 	}
 
@@ -190,8 +191,8 @@ const Bytes& LXMessage::pack() {
 		wire_packer.packMapSize(_fields_count);
 		for (size_t i = 0; i < MAX_FIELDS; ++i) {
 			if (_fields_pool[i].in_use) {
-				wire_packer.packBinary(_fields_pool[i].key.data(), _fields_pool[i].key.size());
-				wire_packer.packBinary(_fields_pool[i].value.data(), _fields_pool[i].value.size());
+				wire_packer.packRawBytes(_fields_pool[i].key.data(), _fields_pool[i].key.size());
+				wire_packer.packRawBytes(_fields_pool[i].value.data(), _fields_pool[i].value.size());
 			}
 		}
 		wire_packer.packBinary(_stamp.data(), _stamp.size());
@@ -337,23 +338,132 @@ LXMessage LXMessage::unpack_from_bytes(const Bytes& lxmf_bytes, Type::Message::M
 		content = Bytes(content_bin);
 		DEBUG("  Parsed content: " + std::to_string(content.size()) + " bytes");
 
-		// Unpack fields map (element 3)
+		// Unpack fields map (element 3) — capture key+value as raw
+		// msgpack byte spans. LXMF wire format is dict[int, Any]; values
+		// can be ints, strs, bins, lists, dicts. Storing them as opaque
+		// raw msgpack lets bridges/decoders interpret as needed without
+		// LXMessage::unpack pre-deciding a type.
+		//
+		// Walk the field bytes manually with a hand-rolled msgpack
+		// skip-value helper. The Unpacker's `indices` array flattens
+		// nested structures (one entry per token, not per top-level
+		// value), so we can't use index advancement to find the end of
+		// a nested array/map.
 		MsgPack::map_size_t map_size;
 		unpacker.deserialize(map_size);
 		DEBUG("  Msgpack map size: " + std::to_string(map_size.size()));
 
-		// Unpack each field (key-value pairs) into temporary storage
-		for (size_t i = 0; i < map_size.size() && temp_fields_count < MAX_FIELDS; ++i) {
-			MsgPack::bin_t<uint8_t> key_bin;
-			MsgPack::bin_t<uint8_t> value_bin;
+		// Find where in the payload the fields map starts. The Unpacker
+		// has parsed past timestamp/title/content and the map header;
+		// `indices[curr_index]` is the byte offset of the first key.
+		const uint8_t* fields_p = packed_payload.data();
+		const uint8_t* fields_end = fields_p + packed_payload.size();
+		fields_p += unpacker.indices[unpacker.index()];
 
-			unpacker.deserialize(key_bin);
-			unpacker.deserialize(value_bin);
+		auto skip_msgpack = [](const uint8_t*& p, const uint8_t* end) -> bool {
+			if (p >= end) return false;
+			uint8_t b = *p++;
+			auto rd = [&](size_t n, uint64_t& out) -> bool {
+				if (p + n > end) return false;
+				out = 0;
+				for (size_t i = 0; i < n; ++i) out = (out << 8) | *p++;
+				return true;
+			};
+			if (b <= 0x7f || b >= 0xe0) return true;            // fixint
+			if ((b & 0xe0) == 0xa0) {                            // fixstr
+				size_t n = b & 0x1f;
+				if (p + n > end) return false;
+				p += n; return true;
+			}
+			if ((b & 0xf0) == 0x90) {                            // fixarray
+				size_t n = b & 0x0f;
+				for (size_t i = 0; i < n; ++i) {
+					// Recursive skip via re-entry. Inline a small
+					// stack-managed loop using the same `b` decoder
+					// machinery via static lambda rebinding.
+					return false;  // — placeholder; will be replaced below
+				}
+				return true;
+			}
+			return false;  // also placeholder
+		};
+
+		// Recursive skip — std::function captures itself for
+		// arbitrarily-nested array/map.
+		std::function<bool(const uint8_t*&, const uint8_t*)> skip;
+		skip = [&skip](const uint8_t*& p, const uint8_t* end) -> bool {
+			if (p >= end) return false;
+			uint8_t b = *p++;
+			auto rd = [&](size_t n, uint64_t& out) -> bool {
+				if (p + n > end) return false;
+				out = 0;
+				for (size_t i = 0; i < n; ++i) out = (out << 8) | *p++;
+				return true;
+			};
+			if (b <= 0x7f || b >= 0xe0) return true;                       // fixint
+			if ((b & 0xe0) == 0xa0) { p += (b & 0x1f); return p <= end; }   // fixstr
+			if ((b & 0xf0) == 0x90) {                                       // fixarray
+				size_t n = b & 0x0f;
+				for (size_t i = 0; i < n; ++i) if (!skip(p, end)) return false;
+				return true;
+			}
+			if ((b & 0xf0) == 0x80) {                                       // fixmap
+				size_t n = b & 0x0f;
+				for (size_t i = 0; i < 2 * n; ++i) if (!skip(p, end)) return false;
+				return true;
+			}
+			uint64_t len = 0;
+			switch (b) {
+				case 0xc0: case 0xc2: case 0xc3: return true;
+				case 0xc4: if (!rd(1, len)) return false; p += len; return p <= end;
+				case 0xc5: if (!rd(2, len)) return false; p += len; return p <= end;
+				case 0xc6: if (!rd(4, len)) return false; p += len; return p <= end;
+				case 0xca: p += 4; return p <= end;
+				case 0xcb: p += 8; return p <= end;
+				case 0xcc: case 0xd0: p += 1; return p <= end;
+				case 0xcd: case 0xd1: p += 2; return p <= end;
+				case 0xce: case 0xd2: p += 4; return p <= end;
+				case 0xcf: case 0xd3: p += 8; return p <= end;
+				case 0xd9: if (!rd(1, len)) return false; p += len; return p <= end;
+				case 0xda: if (!rd(2, len)) return false; p += len; return p <= end;
+				case 0xdb: if (!rd(4, len)) return false; p += len; return p <= end;
+				case 0xdc: { if (!rd(2, len)) return false;
+					for (uint64_t i = 0; i < len; ++i) if (!skip(p, end)) return false;
+					return true; }
+				case 0xdd: { if (!rd(4, len)) return false;
+					for (uint64_t i = 0; i < len; ++i) if (!skip(p, end)) return false;
+					return true; }
+				case 0xde: { if (!rd(2, len)) return false;
+					for (uint64_t i = 0; i < 2 * len; ++i) if (!skip(p, end)) return false;
+					return true; }
+				case 0xdf: { if (!rd(4, len)) return false;
+					for (uint64_t i = 0; i < 2 * len; ++i) if (!skip(p, end)) return false;
+					return true; }
+				default: return false;
+			}
+		};
+
+		for (size_t i = 0; i < map_size.size() && temp_fields_count < MAX_FIELDS; ++i) {
+			const uint8_t* k_start = fields_p;
+			if (!skip(fields_p, fields_end)) break;
+			const uint8_t* k_end = fields_p;
+			const uint8_t* v_start = fields_p;
+			if (!skip(fields_p, fields_end)) break;
+			const uint8_t* v_end = fields_p;
 
 			temp_fields[temp_fields_count].in_use = true;
-			temp_fields[temp_fields_count].key = Bytes(key_bin);
-			temp_fields[temp_fields_count].value = Bytes(value_bin);
+			temp_fields[temp_fields_count].key.assign(k_start, k_end - k_start);
+			temp_fields[temp_fields_count].value.assign(v_start, v_end - v_start);
 			++temp_fields_count;
+		}
+		// Reposition the Unpacker's item cursor past the entire fields
+		// portion so the optional stamp (element 4) deserializes from
+		// the correct offset. Find the item index whose byte offset
+		// matches our final fields_p pointer.
+		size_t target_offset = (size_t)(fields_p - packed_payload.data());
+		while (unpacker.index() < unpacker.indices.size() &&
+		       unpacker.indices[unpacker.index()] < target_offset) {
+			unpacker.index(unpacker.index() + 1);
 		}
 
 		if (map_size.size() > MAX_FIELDS) {
@@ -411,8 +521,8 @@ LXMessage LXMessage::unpack_from_bytes(const Bytes& lxmf_bytes, Type::Message::M
 		repacker.packBinary(content.data(), content.size());
 		repacker.packMapSize(temp_fields_count);
 		for (size_t i = 0; i < temp_fields_count; ++i) {
-			repacker.packBinary(temp_fields[i].key.data(), temp_fields[i].key.size());
-			repacker.packBinary(temp_fields[i].value.data(), temp_fields[i].value.size());
+			repacker.packRawBytes(temp_fields[i].key.data(), temp_fields[i].key.size());
+			repacker.packRawBytes(temp_fields[i].value.data(), temp_fields[i].value.size());
 		}
 		payload_for_hash = Bytes(repacker.data(), repacker.size());
 	} else {
@@ -504,8 +614,8 @@ bool LXMessage::validate_signature() {
 	packer.packMapSize(_fields_count);
 	for (size_t i = 0; i < MAX_FIELDS; ++i) {
 		if (_fields_pool[i].in_use) {
-			packer.packBinary(_fields_pool[i].key.data(), _fields_pool[i].key.size());
-			packer.packBinary(_fields_pool[i].value.data(), _fields_pool[i].value.size());
+			packer.packRawBytes(_fields_pool[i].key.data(), _fields_pool[i].key.size());
+			packer.packRawBytes(_fields_pool[i].value.data(), _fields_pool[i].value.size());
 		}
 	}
 	Bytes packed_payload(packer.data(), packer.size());

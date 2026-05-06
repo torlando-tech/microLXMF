@@ -5,6 +5,7 @@
 
 #include "../bridge.h"
 #include "../runtime/Runtime.h"
+#include "../runtime/MsgPackUtil.h"
 
 #include <Bytes.h>
 
@@ -17,6 +18,25 @@ inline RNS::Bytes to_rns(const bridge::Bytes& v) {
 }
 inline bridge::Bytes from_rns(const RNS::Bytes& b) {
     return bridge::Bytes(b.data(), b.data() + b.size());
+}
+
+// Decode the harness's `fields` JSON shape into the FieldList format
+// the runtime expects (each entry is (key_msgpack_bytes, value_msgpack_bytes)).
+// `fields_param` is a JSON object with int-stringified keys and tagged
+// values, e.g. {"5": [{"str":"f"}, {"bytes":"abcd"}]}.
+inline bridge::Runtime::FieldList decode_fields(const bridge::json& fields_param) {
+    bridge::Runtime::FieldList out;
+    if (!fields_param.is_object()) return out;
+    bridge::MsgPackEncoder enc;
+    for (auto it = fields_param.begin(); it != fields_param.end(); ++it) {
+        int64_t k_int = std::stoll(it.key());
+        auto k_msgpack = enc.encode_int_key(k_int);
+        auto v_msgpack = enc.encode_value(it.value());
+        RNS::Bytes k_b(k_msgpack.data(), k_msgpack.size());
+        RNS::Bytes v_b(v_msgpack.data(), v_msgpack.size());
+        out.push_back({k_b, v_b});
+    }
+    return out;
 }
 
 }  // namespace
@@ -70,7 +90,9 @@ REGISTER_COMMAND(lxmf_send_opportunistic, {
     auto dest_hash = bridge::hex_param(p, "destination_hash");
     std::string content = bridge::str_param(p, "content");
     std::string title = bridge::str_param_or(p, "title", "");
-    auto hash = rt.send_opportunistic(to_rns(dest_hash), content, title);
+    auto fields = p.contains("fields") ? decode_fields(p["fields"])
+                                       : bridge::Runtime::FieldList();
+    auto hash = rt.send_opportunistic(to_rns(dest_hash), content, title, fields);
     return bridge::json{{"message_hash", bridge::to_hex(from_rns(hash))}};
 })
 
@@ -79,7 +101,9 @@ REGISTER_COMMAND(lxmf_send_direct, {
     auto dest_hash = bridge::hex_param(p, "destination_hash");
     std::string content = bridge::str_param(p, "content");
     std::string title = bridge::str_param_or(p, "title", "");
-    auto hash = rt.send_direct(to_rns(dest_hash), content, title);
+    auto fields = p.contains("fields") ? decode_fields(p["fields"])
+                                       : bridge::Runtime::FieldList();
+    auto hash = rt.send_direct(to_rns(dest_hash), content, title, fields);
     return bridge::json{{"message_hash", bridge::to_hex(from_rns(hash))}};
 })
 
@@ -88,7 +112,9 @@ REGISTER_COMMAND(lxmf_send_propagated, {
     auto dest_hash = bridge::hex_param(p, "destination_hash");
     std::string content = bridge::str_param(p, "content");
     std::string title = bridge::str_param_or(p, "title", "");
-    auto hash = rt.send_propagated(to_rns(dest_hash), content, title);
+    auto fields = p.contains("fields") ? decode_fields(p["fields"])
+                                       : bridge::Runtime::FieldList();
+    auto hash = rt.send_propagated(to_rns(dest_hash), content, title, fields);
     return bridge::json{{"message_hash", bridge::to_hex(from_rns(hash))}};
 })
 
@@ -131,6 +157,7 @@ REGISTER_COMMAND(lxmf_get_received_messages, {
             {"method", m.method},
             {"ack_status", m.ack_status},
             {"received_at_ms", m.received_at_ms},
+            {"fields", m.fields},
         });
     }
     return bridge::json{

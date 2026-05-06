@@ -1,5 +1,7 @@
 // Bridge runtime — owns the long-lived microReticulum + microLXMF state
 // for one node.
+
+#include "../json.hpp"
 //
 // One process represents one LXMF node. Runtime is a singleton because
 // microReticulum's `Reticulum`, `Transport`, `Identity::recall` are
@@ -50,6 +52,10 @@ public:
         std::string method;     // "opportunistic", "direct", "propagated"
         std::string ack_status; // "received"
         uint64_t received_at_ms = 0;
+        // LXMF fields decoded from msgpack into the harness's "inbox"
+        // shape: {"<int_key>": <python-encoded value>}. Bytes-typed
+        // fields are bare hex strings; nested arrays/maps recurse.
+        nlohmann::json fields = nlohmann::json::object();
     };
 
     static Runtime& instance();
@@ -66,8 +72,8 @@ public:
                                   const std::string& host, int port);
 
     // LXMF actions. `fields` is a vector of (key, value) byte pairs —
-    // the bridge protocol's wire-level fields representation. Empty for
-    // simple messages.
+    // each entry is a pre-encoded msgpack key-bytes / value-bytes pair
+    // that LXMessage::pack splices raw into the fields map.
     using FieldList = std::vector<std::pair<RNS::Bytes, RNS::Bytes>>;
 
     void announce();

@@ -1,5 +1,6 @@
 #include "Runtime.h"
 #include "PosixTCPInterface.h"
+#include "MsgPackUtil.h"
 
 #include <Cryptography/Random.h>
 #include <Destination.h>
@@ -383,6 +384,31 @@ void Runtime::on_delivery(LXMF::LXMessage& msg) {
         rm.title = std::string((const char*)t.data(), t.size());
         const Bytes& c = msg.content();
         rm.content = std::string((const char*)c.data(), c.size());
+    }
+    // Decode each field's raw msgpack key+value into the harness
+    // "inbox" shape (str-keyed object, python-style values).
+    // field_at(i) takes the POOL index, not a sequential index — scan
+    // the whole pool and decode only `in_use` entries. Each field's
+    // key+value are stored as raw msgpack byte spans (set by
+    // LXMessage::unpack); decode each via the bridge's hand-rolled
+    // walker into the lxmf-conformance "inbox" shape.
+    for (size_t i = 0; i < LXMF::MAX_FIELDS; ++i) {
+        const auto* fe = msg.field_at(i);
+        if (!fe) continue;
+        try {
+            MsgPackDecoder kdec(fe->key.data(), fe->key.size());
+            json k_json = kdec.read_value();
+            std::string k_str;
+            if (k_json.is_number_integer()) k_str = std::to_string(k_json.get<int64_t>());
+            else if (k_json.is_string()) k_str = k_json.get<std::string>();
+            else k_str = k_json.dump();
+
+            MsgPackDecoder vdec(fe->value.data(), fe->value.size());
+            json v_json = vdec.read_value();
+            rm.fields[k_str] = v_json;
+        } catch (const std::exception&) {
+            // skip undecodable field
+        }
     }
     switch (msg.method()) {
         case LXMF::Type::Message::OPPORTUNISTIC: rm.method = "opportunistic"; break;
