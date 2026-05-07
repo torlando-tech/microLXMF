@@ -62,6 +62,7 @@ void MessageStore::ConversationInfo::clear() {
 	last_activity = 0.0;
 	unread_count = 0;
 	memset(last_message_hash, 0, MESSAGE_HASH_SIZE);
+	memset(display_name, 0, sizeof(display_name));
 }
 
 // ConversationSlot helper method
@@ -178,6 +179,20 @@ void MessageStore::load_index() {
 				slot.info.set_last_message_hash(last_msg_bytes);
 			}
 
+			// Restore the cached display name. Authoritative source is
+			// Identity::recall_app_data, which is in-memory and lost on
+			// reboot; we cache the last-seen name here so the conv list
+			// can show real names instead of hashes immediately on cold
+			// start. The cache gets refreshed once a fresh announce
+			// arrives.
+			if (!conv["display_name"].isNull()) {
+				const char* dn = conv["display_name"];
+				if (dn) {
+					strncpy(slot.info.display_name, dn, MAX_DISPLAY_NAME_LEN);
+					slot.info.display_name[MAX_DISPLAY_NAME_LEN] = '\0';
+				}
+			}
+
 			++slot_index;
 		}
 
@@ -214,6 +229,12 @@ bool MessageStore::save_index() {
 			Bytes last_msg = info.last_message_hash_bytes();
 			if (last_msg) {
 				conv["last_message_hash"] = last_msg.toHex();
+			}
+
+			// Persist the cached display name (if any) so it survives
+			// reboots — see load_index for the rationale.
+			if (info.display_name[0] != '\0') {
+				conv["display_name"] = info.display_name;
 			}
 
 			// Serialize message hashes
@@ -377,6 +398,25 @@ void MessageStore::set_archive_filesystem(microStore::FileSystem fs,
 
 bool MessageStore::has_archive() const {
 	return (bool)_archive_fs;
+}
+
+bool MessageStore::set_display_name(const Bytes& peer_hash,
+                                    const std::string& display_name) {
+	ConversationSlot* slot = find_conversation(peer_hash);
+	if (!slot) return false;
+	if (display_name.empty()) return false;
+	if (display_name == slot->info.display_name) return false;  // No change
+
+	strncpy(slot->info.display_name, display_name.c_str(), MAX_DISPLAY_NAME_LEN);
+	slot->info.display_name[MAX_DISPLAY_NAME_LEN] = '\0';
+	save_index();
+	return true;
+}
+
+std::string MessageStore::get_display_name(const Bytes& peer_hash) const {
+	const ConversationSlot* slot = find_conversation(peer_hash);
+	if (!slot) return std::string();
+	return std::string(slot->info.display_name);
 }
 
 std::string MessageStore::get_archive_message_path(const Bytes& message_hash) const {

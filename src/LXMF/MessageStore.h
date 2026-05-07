@@ -65,6 +65,13 @@ namespace LXMF {
 		/**
 		 * @brief Conversation metadata with fixed-size message hash storage
 		 */
+		// Cache of the peer's last-known LXMF display name. The
+		// authoritative source is Identity::recall_app_data(peer_hash),
+		// which is in-memory only and lost on reboot — without this
+		// cache the conversation list falls back to truncated hashes
+		// every cold start until the peer re-announces.
+		static constexpr size_t MAX_DISPLAY_NAME_LEN = 47;  // 47 + nul = 48
+
 		struct ConversationInfo {
 			// Fixed arrays eliminate ~6KB Bytes metadata overhead per conversation
 			// (256 messages × 24 bytes metadata = 6.1KB saved per conversation)
@@ -74,6 +81,7 @@ namespace LXMF {
 			double last_activity = 0.0;        // Timestamp of most recent message
 			size_t unread_count = 0;           // Number of unread messages
 			uint8_t last_message_hash[MESSAGE_HASH_SIZE];
+			char display_name[MAX_DISPLAY_NAME_LEN + 1] = {0};  // Last seen, nul-terminated
 
 			// Helper methods for accessing fixed arrays as Bytes
 			RNS::Bytes peer_hash_bytes() const { return RNS::Bytes(peer_hash, PEER_HASH_SIZE); }
@@ -198,6 +206,30 @@ namespace LXMF {
 		 * @brief Whether an archive filesystem is configured
 		 */
 		bool has_archive() const;
+
+		/**
+		 * @brief Cache a peer's LXMF display name in the conversation
+		 *        index. The name is persisted to conv.json so it
+		 *        survives reboots — without this the conversation list
+		 *        falls back to truncated hashes every cold start until
+		 *        the peer re-announces.
+		 *
+		 * @param peer_hash    Peer's destination hash
+		 * @param display_name Resolved display name (eg from
+		 *                     LXMF::display_name_from_app_data on
+		 *                     Identity::recall_app_data result)
+		 * @return True if the name was stored / updated. No-op if the
+		 *         conversation isn't in the pool yet, or if the cached
+		 *         name is already identical.
+		 */
+		bool set_display_name(const RNS::Bytes& peer_hash,
+		                      const std::string& display_name);
+
+		/**
+		 * @brief Read the cached display name for a peer.
+		 * @return Empty string if none cached.
+		 */
+		std::string get_display_name(const RNS::Bytes& peer_hash) const;
 
 		/**
 		 * @brief Save a message to storage
