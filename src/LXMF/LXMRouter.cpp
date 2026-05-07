@@ -1396,6 +1396,19 @@ void LXMRouter::set_outbound_propagation_node(const Bytes& node_hash) {
 	snprintf(buf, sizeof(buf), "Set outbound propagation node (%d bytes): %s",
 		(int)node_hash.size(), node_hash.toHex().c_str());
 	INFO(buf);
+
+	// If we don't have the PN's identity yet, request the path
+	// proactively so the next-hop ships back the cached announce
+	// (which carries the identity public key). Without this, the
+	// first PROPAGATED send blocks process_outbound for up to one
+	// PN announce-interval (lxmd default = 5 min) waiting for the
+	// identity to arrive on its own — and during that wait the
+	// outbound queue head is stuck on the prop message, preventing
+	// DIRECT and OPPORTUNISTIC sends from progressing too.
+	if (!RNS::Identity::recall(node_hash) && !RNS::Transport::has_path(node_hash)) {
+		INFO("  Requesting path to propagation node...");
+		RNS::Transport::request_path(node_hash);
+	}
 }
 
 void LXMRouter::register_sync_complete_callback(SyncCompleteCallback callback) {
