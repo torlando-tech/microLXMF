@@ -4,6 +4,7 @@
 #include <Bytes.h>
 
 #include <ArduinoJson.h>
+#include <microStore/FileSystem.h>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,29 @@ namespace LXMF {
 	static constexpr size_t MAX_MESSAGES_PER_CONVERSATION = 256;
 	static constexpr size_t MESSAGE_HASH_SIZE = 32;  // SHA256 hash
 	static constexpr size_t PEER_HASH_SIZE = 16;     // Truncated hash
+
+	// Two-tier storage policy. The default `MessageStore` constructor
+	// keeps everything on the main filesystem (the pre-tiered behavior),
+	// which works fine until the partition fills up. Pyxis's LittleFS
+	// partition is 1.875 MB and a sustained-receive soak can fill it
+	// in ~30 min — at which point lfs_alloc panics with /0.
+	//
+	// To make the store sustainable, the consumer can supply a SECOND
+	// filesystem via `set_archive_filesystem()` (eg microSD on T-Deck).
+	// When set, save_message cull-walks each conversation after every
+	// save: messages older than HOT_MESSAGES_PER_CONVERSATION are
+	// MOVED (copy + delete) from the primary filesystem to the archive
+	// filesystem. load_message tries primary first, then archive.
+	//
+	// The conversation's full hash list (up to MAX_MESSAGES_PER_CONVERSATION)
+	// stays in the in-memory index either way, so scrollback past the
+	// hot count just hits the archive. If the hash list itself fills,
+	// add_message_hash evicts the oldest entirely (and deletes its
+	// archive file too) — a hard cap.
+	//
+	// Without an archive filesystem set, cull just deletes — bounded
+	// in-flash storage, but no historical scrollback.
+	static constexpr size_t HOT_MESSAGES_PER_CONVERSATION = 50;
 
 	/**
 	 * @brief Message persistence and conversation management for LXMF
@@ -153,6 +177,28 @@ namespace LXMF {
 		~MessageStore();
 
 	public:
+		/**
+		 * @brief Configure an archive filesystem for older messages
+		 *
+		 * When set, save_message cull-walks each conversation after every
+		 * save: messages older than HOT_MESSAGES_PER_CONVERSATION are
+		 * moved from the primary (hot) filesystem to this archive
+		 * filesystem. load_message falls back to the archive on a miss.
+		 *
+		 * @param fs        Archive filesystem (eg microSD on T-Deck).
+		 *                  Pass an empty filesystem (default-constructed)
+		 *                  to disable archiving.
+		 * @param base_path Subdirectory on the archive filesystem to use
+		 *                  for the message store. Defaults to the same
+		 *                  base_path used for the hot filesystem.
+		 */
+		void set_archive_filesystem(microStore::FileSystem fs, const std::string& base_path = "");
+
+		/**
+		 * @brief Whether an archive filesystem is configured
+		 */
+		bool has_archive() const;
+
 		/**
 		 * @brief Save a message to storage
 		 *
@@ -357,9 +403,69 @@ namespace LXMF {
 		size_t count_conversations() const;
 
 	private:
+		/**
+		 * @brief Evict the OLDEST message from a conversation, freeing
+		 *        storage in both hot (if present) and archive (if present)
+		 *        and removing it from the in-memory hash list.
+		 *
+		 * Called when add_message_hash hits MAX_MESSAGES_PER_CONVERSATION.
+		 * Without this, the hard cap would silently start dropping NEW
+		 * messages once a conversation was full — instead we drop the
+		 * oldest (which is presumably already archived and rarely touched)
+		 * and let new messages flow in.
+		 *
+		 * @return True if eviction freed a slot, false otherwise.
+		 */
+		bool evict_oldest_message(ConversationInfo& conv);
+
+		/**
+		 * @brief Cull-walk a conversation, archiving messages older than
+		 *        HOT_MESSAGES_PER_CONVERSATION.
+		 *
+		 * For each in-memory hash beyond the hot count, copy the file
+		 * from the primary filesystem to the archive (if set) and
+		 * delete the primary copy. If no archive is set, just delete.
+		 * The hash stays in the in-memory list either way.
+		 */
+		void cull_conversation_to_hot(const RNS::Bytes& peer_hash);
+
+		/**
+		 * @brief Move a single message file from hot → archive.
+		 * @return True if archive successful, false otherwise. Hot copy
+		 *         is removed iff archive succeeded (or no archive_fs).
+		 */
+		bool archive_one_message(const RNS::Bytes& message_hash);
+
+		/**
+		 * @brief Build the archive-side path for a message hash.
+		 */
+		std::string get_archive_message_path(const RNS::Bytes& message_hash) const;
+
+		/**
+		 * @brief Read a file from the archive filesystem.
+		 * @return Number of bytes read; 0 on miss / no archive.
+		 *
+		 * Not const because microStore::FileSystem's accessors are
+		 * non-const (they assert _impl and forward through a shared_ptr).
+		 */
+		size_t read_archive_file(const char* path, RNS::Bytes& out);
+
+		/**
+		 * @brief Write a file to the archive filesystem.
+		 * @return Number of bytes written; 0 on failure / no archive.
+		 */
+		size_t write_archive_file(const char* path, const RNS::Bytes& data);
+
+	private:
 		std::string _base_path;
 		ConversationSlot _conversations_pool[MAX_CONVERSATIONS];
 		bool _initialized;
+
+		// Optional archive filesystem (eg microSD). When `_archive_fs`
+		// is truthy, save_message cull-walks each conversation and
+		// older messages flow to `<_archive_path>/messages/<hash>.json`.
+		microStore::FileSystem _archive_fs;
+		std::string _archive_path;
 
 		// Reusable JSON document to reduce heap fragmentation
 		// Note: This class is assumed to be used from a single thread (main loop).

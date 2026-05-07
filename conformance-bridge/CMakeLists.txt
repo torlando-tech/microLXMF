@@ -205,3 +205,21 @@ target_compile_definitions(microLXMFBridge PRIVATE
 
 find_package(Threads REQUIRED)
 target_link_libraries(microLXMFBridge PRIVATE Threads::Threads)
+
+# ============================================================================
+# Host-side test: validates MessageStore two-tier (hot + archive) behavior.
+# Runs via `./test_messagestore_tiers` after `cmake --build build/`. No
+# hardware needed — uses two temp dirs as POSIX-backed hot + archive
+# filesystems and exercises cull, archive fallback, hard-cap eviction.
+# ============================================================================
+add_executable(test_messagestore_tiers tests/test_messagestore_tiers.cpp)
+target_include_directories(test_messagestore_tiers PRIVATE src)
+target_link_libraries(test_messagestore_tiers PRIVATE MicroLXMFLib Threads::Threads)
+target_compile_options(test_messagestore_tiers PRIVATE
+    -fexceptions
+    -Wall -Wno-unused-parameter -Wno-missing-field-initializers
+)
+target_compile_definitions(test_messagestore_tiers PRIVATE
+    MICROLXMF_NATIVE=1
+    NATIVE=1
+)

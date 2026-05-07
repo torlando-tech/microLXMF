@@ -301,6 +301,12 @@ bool MessageStore::save_message(const LXMessage& message) {
 		bool already_exists = conv.has_message(message.hash());
 
 		if (!already_exists) {
+			// Hard-cap: if the in-memory hash list is at MAX, evict
+			// the oldest entry (frees one slot AND its archived file
+			// on the SD card) so new messages aren't silently dropped.
+			if (conv.message_count >= MAX_MESSAGES_PER_CONVERSATION) {
+				evict_oldest_message(conv);
+			}
 			if (!conv.add_message_hash(message.hash())) {
 				WARNING("Message pool full for conversation: " + peer_hash.toHex());
 			} else {
@@ -319,12 +325,187 @@ bool MessageStore::save_message(const LXMessage& message) {
 		// Save updated index
 		save_index();
 
+		// Cull this conversation down to HOT_MESSAGES_PER_CONVERSATION:
+		// older messages are MOVED to the archive filesystem if one
+		// has been set, otherwise just deleted from the hot filesystem.
+		// In either case the hash stays in the in-memory index, so the
+		// UI can still list older messages and load_message will fall
+		// through to the archive on a miss.
+		cull_conversation_to_hot(peer_hash);
+
 		INFO("Message saved successfully");
 		return true;
 
 	} catch (const std::exception& e) {
 		ERROR("Exception saving message: " + std::string(e.what()));
 		return false;
+	}
+}
+
+// ============================================================================
+// Two-tier (hot + archive) storage helpers
+// ============================================================================
+
+void MessageStore::set_archive_filesystem(microStore::FileSystem fs,
+                                          const std::string& base_path) {
+	_archive_fs = fs;
+	if (!base_path.empty()) {
+		_archive_path = base_path;
+	} else {
+		// Default to the same base path used for the hot store. On
+		// pyxis this resolves to "/lxmf" → archived files live at
+		// "/lxmf/m/<hash>.j" on the SD card.
+		_archive_path = _base_path;
+	}
+	if (_archive_fs) {
+		// Pre-create the archive's directory layout so the first
+		// archive_one_message call doesn't trip on a missing dir.
+		// Mirror the hot side: the path used by get_message_path is
+		// `/m/<12chars>.j`, so we need `<archive_path>/m/`.
+		if (!_archive_path.empty() && !_archive_fs.exists(_archive_path.c_str())) {
+			_archive_fs.mkdir(_archive_path.c_str());
+		}
+		std::string messages_dir = _archive_path + "/m";
+		if (!_archive_fs.exists(messages_dir.c_str())) {
+			_archive_fs.mkdir(messages_dir.c_str());
+		}
+		INFO("Archive filesystem set; archive_path=" + _archive_path);
+	} else {
+		INFO("Archive filesystem cleared");
+	}
+}
+
+bool MessageStore::has_archive() const {
+	return (bool)_archive_fs;
+}
+
+std::string MessageStore::get_archive_message_path(const Bytes& message_hash) const {
+	// Mirror the hot-side relative layout (`/m/<12chars>.j`) under the
+	// archive prefix so we can copy bytes 1:1 between the two
+	// filesystems. The hot path uses an absolute leading "/" because
+	// LittleFS is mounted at root; on SD we want this nested under a
+	// per-app dir, so the archive_path is prepended verbatim.
+	return _archive_path + get_message_path(message_hash);
+}
+
+size_t MessageStore::read_archive_file(const char* path, Bytes& out) {
+	if (!_archive_fs || !_archive_fs.exists(path)) return 0;
+	microStore::File f = _archive_fs.open(path, microStore::File::ModeRead);
+	if (!f) return 0;
+	const size_t sz = f.size();
+	if (sz == 0) { f.close(); return 0; }
+	uint8_t* buf = out.writable(sz);
+	size_t n_read = f.read(buf, sz);
+	f.close();
+	out.resize(n_read);
+	return n_read;
+}
+
+size_t MessageStore::write_archive_file(const char* path, const Bytes& data) {
+	if (!_archive_fs) return 0;
+	microStore::File f = _archive_fs.open(path, microStore::File::ModeWrite);
+	if (!f) return 0;
+	size_t n = f.write(data.data(), data.size());
+	f.close();
+	return n;
+}
+
+bool MessageStore::archive_one_message(const Bytes& message_hash) {
+	std::string hot_path = get_message_path(message_hash);
+	if (!Utilities::OS::file_exists(hot_path.c_str())) {
+		// Already gone (eg previously archived in a prior session).
+		// Treat as success — the only side effect we care about is
+		// "this hash no longer occupies hot flash."
+		return true;
+	}
+
+	// If we have an archive, copy hot→archive before deleting the hot
+	// copy. If the archive write fails, leave the hot copy alone so
+	// the message isn't lost. If we have no archive, just delete the
+	// hot copy (bounded in-flash storage, no historical scrollback).
+	if (_archive_fs) {
+		Bytes data;
+		if (Utilities::OS::read_file(hot_path.c_str(), data) == 0) {
+			WARNING("archive_one_message: read_file(hot) returned 0 for "
+			        + hot_path);
+			return false;
+		}
+		std::string arch_path = get_archive_message_path(message_hash);
+		size_t written = write_archive_file(arch_path.c_str(), data);
+		if (written != data.size()) {
+			WARNING("archive_one_message: archive write short ("
+			        + std::to_string(written) + "/"
+			        + std::to_string(data.size()) + " bytes) for "
+			        + arch_path + " — keeping hot copy");
+			return false;
+		}
+		DEBUG("archive_one_message: " + message_hash.toHex().substr(0, 16)
+		      + "... → archive (" + std::to_string(written) + " bytes)");
+	}
+
+	// Delete from hot. If this fails the message exists in BOTH places,
+	// which is wasteful but not corrupting; the next compaction sweeps
+	// it. We log for visibility.
+	if (!Utilities::OS::remove_file(hot_path.c_str())) {
+		WARNING("archive_one_message: remove_file(hot) failed for "
+		        + hot_path);
+	}
+	return true;
+}
+
+bool MessageStore::evict_oldest_message(ConversationInfo& conv) {
+	if (conv.message_count == 0) return false;
+
+	// Index 0 is the oldest message in the conversation. With cull
+	// running on every save, index 0 is normally already in archive
+	// (or evicted entirely if no archive_fs is set). Either way, we
+	// want it gone from BOTH tiers and from the in-memory list.
+	Bytes oldest = conv.message_hash_bytes(0);
+	if (oldest.size() == 0) return false;
+
+	// Hot — likely already gone, but check & remove for safety.
+	std::string hot_path = get_message_path(oldest);
+	if (Utilities::OS::file_exists(hot_path.c_str())) {
+		Utilities::OS::remove_file(hot_path.c_str());
+	}
+	// Archive — the actual storage location for old messages.
+	if (_archive_fs) {
+		std::string arch_path = get_archive_message_path(oldest);
+		if (_archive_fs.exists(arch_path.c_str())) {
+			_archive_fs.remove(arch_path.c_str());
+		}
+	}
+	// Drop from the in-memory hash list (shifts all indices down).
+	bool removed = conv.remove_message_hash(oldest);
+	if (removed) {
+		INFO("evict_oldest_message: hard-cap evicted "
+		     + oldest.toHex().substr(0, 16) + "...");
+	}
+	return removed;
+}
+
+void MessageStore::cull_conversation_to_hot(const Bytes& peer_hash) {
+	ConversationSlot* slot = find_conversation(peer_hash);
+	if (!slot) return;
+	ConversationInfo& conv = slot->info;
+	if (conv.message_count <= HOT_MESSAGES_PER_CONVERSATION) return;
+
+	// Messages are appended in chronological order, so the OLDEST live
+	// at the lowest indices. Archive everything from index 0 up to
+	// (count - HOT_MESSAGES_PER_CONVERSATION). The hashes stay in the
+	// in-memory list; only the file location changes.
+	size_t archive_count = conv.message_count - HOT_MESSAGES_PER_CONVERSATION;
+	size_t archived = 0;
+	for (size_t i = 0; i < archive_count; ++i) {
+		Bytes hash = conv.message_hash_bytes(i);
+		if (hash.size() == 0) continue;
+		if (archive_one_message(hash)) ++archived;
+	}
+	if (archived > 0) {
+		std::string verb = _archive_fs ? "archived" : "evicted";
+		INFO("cull_conversation_to_hot: " + verb + " "
+		     + std::to_string(archived) + " message(s) for peer "
+		     + peer_hash.toHex().substr(0, 16) + "...");
 	}
 }
 
@@ -337,15 +518,31 @@ LXMessage MessageStore::load_message(const Bytes& message_hash) {
 
 	std::string message_path = get_message_path(message_hash);
 
-	if (!Utilities::OS::file_exists(message_path.c_str())) {
-		WARNING("Message file not found: " + message_path);
+	// Two-phase read: hot first, then archive. The archive path is
+	// only consulted on a hot miss, so the common case (recent
+	// scrollback within HOT_MESSAGES_PER_CONVERSATION) stays a
+	// single internal-flash read.
+	bool in_hot = Utilities::OS::file_exists(message_path.c_str());
+	bool in_archive = !in_hot && _archive_fs
+	                  && _archive_fs.exists(get_archive_message_path(message_hash).c_str());
+
+	if (!in_hot && !in_archive) {
+		WARNING("Message file not found: " + message_path
+		        + (_archive_fs ? " (also missing from archive)" : ""));
 		return LXMessage(Bytes(), Bytes(), Bytes(), Bytes());
 	}
 
 	try {
-		// Read JSON file via OS abstraction (SPIFFS compatible)
 		Bytes data;
-		if (Utilities::OS::read_file(message_path.c_str(), data) == 0) {
+		size_t n_read = 0;
+		if (in_hot) {
+			n_read = Utilities::OS::read_file(message_path.c_str(), data);
+		} else {
+			std::string arch_path = get_archive_message_path(message_hash);
+			n_read = read_archive_file(arch_path.c_str(), data);
+			DEBUG("Loaded message from archive: " + message_hash.toHex().substr(0, 16) + "...");
+		}
+		if (n_read == 0) {
 			ERROR("Failed to read message file: " + message_path);
 			return LXMessage(Bytes(), Bytes(), Bytes(), Bytes());
 		}
@@ -392,13 +589,24 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 
 	std::string message_path = get_message_path(message_hash);
 
-	if (!Utilities::OS::file_exists(message_path.c_str())) {
+	// Two-phase read: hot first, then archive (same pattern as load_message).
+	bool in_hot = Utilities::OS::file_exists(message_path.c_str());
+	bool in_archive = !in_hot && _archive_fs
+	                  && _archive_fs.exists(get_archive_message_path(message_hash).c_str());
+	if (!in_hot && !in_archive) {
 		return meta;
 	}
 
 	try {
 		Bytes data;
-		if (Utilities::OS::read_file(message_path.c_str(), data) == 0) {
+		size_t n_read = 0;
+		if (in_hot) {
+			n_read = Utilities::OS::read_file(message_path.c_str(), data);
+		} else {
+			std::string arch_path = get_archive_message_path(message_hash);
+			n_read = read_archive_file(arch_path.c_str(), data);
+		}
+		if (n_read == 0) {
 			return meta;
 		}
 
@@ -438,6 +646,15 @@ bool MessageStore::update_message_state(const Bytes& message_hash, Type::Message
 	std::string message_path = get_message_path(message_hash);
 
 	if (!Utilities::OS::file_exists(message_path.c_str())) {
+		// State updates only matter for messages still in flight (DELIVERED,
+		// FAILED, etc). Once a message is archived it's terminal — silently
+		// skip the update rather than thrashing the SD card with a 1-byte
+		// rewrite.
+		if (_archive_fs && _archive_fs.exists(get_archive_message_path(message_hash).c_str())) {
+			DEBUG("update_message_state: skipping archived message "
+			      + message_hash.toHex().substr(0, 16) + "...");
+			return true;
+		}
 		WARNING("Message file not found: " + message_path);
 		return false;
 	}
@@ -487,12 +704,26 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 
 	INFO("Deleting message: " + message_hash.toHex());
 
-	// Remove message file
+	// Remove message file from BOTH hot and archive — the file might
+	// be in either tier (or even both, briefly, if a previous archive
+	// op got past the write but failed the hot delete).
 	std::string message_path = get_message_path(message_hash);
 	if (Utilities::OS::file_exists(message_path.c_str())) {
 		if (!Utilities::OS::remove_file(message_path.c_str())) {
 			ERROR("Failed to delete message file: " + message_path);
 			return false;
+		}
+	}
+	if (_archive_fs) {
+		std::string arch_path = get_archive_message_path(message_hash);
+		if (_archive_fs.exists(arch_path.c_str())) {
+			if (!_archive_fs.remove(arch_path.c_str())) {
+				WARNING("Failed to delete archived message file: " + arch_path);
+				// Hot copy already gone; logical state is "deleted"
+				// even if the archive blob lingers. Don't fail the
+				// caller — better to leave a dangling file than to
+				// abort a delete that the user explicitly asked for.
+			}
 		}
 	}
 
@@ -590,11 +821,18 @@ bool MessageStore::delete_conversation(const Bytes& peer_hash) {
 
 	INFO("Deleting conversation: " + peer_hash.toHex());
 
-	// Delete all message files
+	// Delete all message files from BOTH hot and archive.
 	for (size_t i = 0; i < slot->info.message_count; ++i) {
-		std::string message_path = get_message_path(slot->info.message_hash_bytes(i));
+		Bytes msg_hash = slot->info.message_hash_bytes(i);
+		std::string message_path = get_message_path(msg_hash);
 		if (Utilities::OS::file_exists(message_path.c_str())) {
 			Utilities::OS::remove_file(message_path.c_str());
+		}
+		if (_archive_fs) {
+			std::string arch_path = get_archive_message_path(msg_hash);
+			if (_archive_fs.exists(arch_path.c_str())) {
+				_archive_fs.remove(arch_path.c_str());
+			}
 		}
 	}
 
