@@ -31,8 +31,7 @@
     "srcDir": "src",
     "includeDir": "src",
     "flags": [
-      "-Isrc",
-      "-Isrc/LXMF"
+      "-Isrc"
     ]
   },
   "export": {

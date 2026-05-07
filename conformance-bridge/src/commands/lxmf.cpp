@@ -8,6 +8,7 @@
 #include "../runtime/MsgPackUtil.h"
 
 #include <Bytes.h>
+#include <Identity.h>
 
 #include <stdexcept>
 
@@ -149,6 +150,22 @@ REGISTER_COMMAND(lxmf_has_path, {
     auto& rt = bridge::Runtime::instance();
     auto dest = bridge::hex_param(p, "destination_hash");
     return bridge::json{{"has_path", rt.has_path(to_rns(dest))}};
+})
+
+// Return the raw app_data bytes (hex) most recently learned for this
+// destination via Identity::recall_app_data. Used by the
+// test_announce_app_data conformance test to verify microReticulum
+// strips the 32-byte X25519 ratchet prefix from announces with
+// `packet.context_flag == FLAG_SET`. If the ratchet leaked into
+// app_data, byte 0 would be a random byte instead of an msgpack
+// array marker (0x90-0x9f or 0xdc).
+REGISTER_COMMAND(lxmf_recall_app_data, {
+    auto dest = bridge::hex_param(p, "destination_hash");
+    RNS::Bytes app_data = RNS::Identity::recall_app_data(to_rns(dest));
+    return bridge::json{
+        {"size", (uint64_t)app_data.size()},
+        {"hex",  bridge::to_hex(from_rns(app_data))},
+    };
 })
 
 REGISTER_COMMAND(lxmf_get_received_messages, {
