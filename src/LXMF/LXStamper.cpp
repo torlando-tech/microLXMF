@@ -12,11 +12,44 @@
 #ifdef ESP_PLATFORM
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include "esp_task_wdt.h"
 #endif
 
+#include <atomic>
+#include <mutex>
+
 using namespace LXMF;
 using namespace RNS;
+
+// =============================================================================
+// Async stamp state — single global slot. Only one stamp in flight at a time.
+// =============================================================================
+namespace {
+	enum class AsyncState : uint8_t {
+		IDLE = 0,
+		RUNNING = 1,
+		DONE_SUCCESS = 2,
+		DONE_FAIL = 3,
+	};
+
+	struct AsyncStampSlot {
+		std::atomic<AsyncState> state{AsyncState::IDLE};
+		// Inputs (read by worker, set by main thread before spawn).
+		Bytes message_id;
+		uint8_t stamp_cost{0};
+		uint16_t expand_rounds{0};
+		// Outputs (written by worker, read by main thread after DONE).
+		Bytes result_stamp;
+		uint8_t result_value{0};
+		// Mutex protects the input/output Bytes from racy access during
+		// the brief windows where state is transitioning. The atomic
+		// state member coordinates which side may touch what.
+		std::mutex slot_mutex;
+	};
+
+	static AsyncStampSlot g_async_stamp;
+}
 
 // Count leading zero bits in a hash buffer
 static uint8_t count_leading_zeros(const uint8_t* hash, size_t size) {
@@ -247,4 +280,140 @@ std::tuple<Bytes, Bytes, uint8_t, Bytes> LXStamper::validate_pn_stamp(
 		  ", value=" + std::to_string(value));
 
 	return {transient_id, lxm_data, value, stamp};
+}
+
+// =============================================================================
+// Async stamp generation — moves the cost=16 grind off the main loop.
+// =============================================================================
+
+#ifdef ESP_PLATFORM
+// Worker task body. Self-deletes on completion. Reads inputs from
+// the global slot, writes outputs back, transitions state to DONE_*.
+extern "C" {
+static void stamp_worker_task(void* arg) {
+	(void)arg;
+	Bytes message_id;
+	uint8_t stamp_cost;
+	uint16_t expand_rounds;
+	{
+		std::lock_guard<std::mutex> lk(g_async_stamp.slot_mutex);
+		message_id = g_async_stamp.message_id;
+		stamp_cost = g_async_stamp.stamp_cost;
+		expand_rounds = g_async_stamp.expand_rounds;
+	}
+	auto [stamp, value] = LXStamper::generate_stamp(
+		message_id, stamp_cost, expand_rounds);
+	{
+		std::lock_guard<std::mutex> lk(g_async_stamp.slot_mutex);
+		if (stamp.size() == LXStamper::STAMP_SIZE) {
+			g_async_stamp.result_stamp = stamp;
+			g_async_stamp.result_value = value;
+			g_async_stamp.state.store(AsyncState::DONE_SUCCESS,
+			                          std::memory_order_release);
+		} else {
+			g_async_stamp.state.store(AsyncState::DONE_FAIL,
+			                          std::memory_order_release);
+		}
+	}
+	vTaskDelete(nullptr);
+}
+}  // extern "C"
+#endif
+
+bool LXStamper::start_async(
+	const Bytes& message_id,
+	uint8_t stamp_cost,
+	uint16_t expand_rounds)
+{
+	// Refuse if a stamp is already in flight or its result is still
+	// waiting to be consumed. Caller must take_async_result() first.
+	AsyncState st = g_async_stamp.state.load(std::memory_order_acquire);
+	if (st != AsyncState::IDLE) {
+		DEBUG("LXStamper::start_async: refusing — state is " +
+		      std::to_string((int)st));
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> lk(g_async_stamp.slot_mutex);
+		g_async_stamp.message_id = message_id;
+		g_async_stamp.stamp_cost = stamp_cost;
+		g_async_stamp.expand_rounds = expand_rounds;
+		g_async_stamp.result_stamp = Bytes();  // clear previous
+		g_async_stamp.result_value = 0;
+	}
+	g_async_stamp.state.store(AsyncState::RUNNING, std::memory_order_release);
+
+#ifdef ESP_PLATFORM
+	// Stamp worker needs ~12KB stack: workblock pointer (256KB on
+	// PSRAM heap, not stack), SHA256 state (~104B), small temp buffers.
+	// Run at priority 1 (idle is 0, loopTask is also 1) so it doesn't
+	// preempt LVGL or higher-priority tasks. Use core 0 to leave core
+	// 1 (the Arduino loopTask core) responsive to UI/serial.
+	BaseType_t ok = xTaskCreatePinnedToCore(
+		stamp_worker_task,
+		"lxstamp",
+		12 * 1024,
+		nullptr,
+		1,
+		nullptr,
+		0);
+	if (ok != pdPASS) {
+		ERROR("LXStamper::start_async: xTaskCreate failed");
+		g_async_stamp.state.store(AsyncState::IDLE, std::memory_order_release);
+		return false;
+	}
+	INFO("LXStamper::start_async: worker spawned for cost " +
+	     std::to_string(stamp_cost));
+	return true;
+#else
+	// Native test build — run synchronously, then transition to DONE.
+	auto [stamp, value] = generate_stamp(message_id, stamp_cost, expand_rounds);
+	{
+		std::lock_guard<std::mutex> lk(g_async_stamp.slot_mutex);
+		if (stamp.size() == STAMP_SIZE) {
+			g_async_stamp.result_stamp = stamp;
+			g_async_stamp.result_value = value;
+			g_async_stamp.state.store(AsyncState::DONE_SUCCESS,
+			                          std::memory_order_release);
+		} else {
+			g_async_stamp.state.store(AsyncState::DONE_FAIL,
+			                          std::memory_order_release);
+		}
+	}
+	return true;
+#endif
+}
+
+bool LXStamper::is_async_running() {
+	return g_async_stamp.state.load(std::memory_order_acquire)
+	       == AsyncState::RUNNING;
+}
+
+bool LXStamper::is_async_done() {
+	AsyncState st = g_async_stamp.state.load(std::memory_order_acquire);
+	return st == AsyncState::DONE_SUCCESS || st == AsyncState::DONE_FAIL;
+}
+
+std::pair<Bytes, uint8_t> LXStamper::take_async_result() {
+	AsyncState st = g_async_stamp.state.load(std::memory_order_acquire);
+	if (st != AsyncState::DONE_SUCCESS && st != AsyncState::DONE_FAIL) {
+		// Caller polled too early or lost track — return empty.
+		return {{}, 0};
+	}
+	std::pair<Bytes, uint8_t> out;
+	{
+		std::lock_guard<std::mutex> lk(g_async_stamp.slot_mutex);
+		if (st == AsyncState::DONE_SUCCESS) {
+			out = {g_async_stamp.result_stamp, g_async_stamp.result_value};
+		} else {
+			out = {{}, 0};
+		}
+		// Clear inputs/outputs and reset state to IDLE so a new
+		// stamp can be started.
+		g_async_stamp.result_stamp = Bytes();
+		g_async_stamp.result_value = 0;
+		g_async_stamp.message_id = Bytes();
+	}
+	g_async_stamp.state.store(AsyncState::IDLE, std::memory_order_release);
+	return out;
 }

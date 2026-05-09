@@ -1524,13 +1524,33 @@ bool LXMRouter::send_propagated(LXMessage& message) {
 		return false;  // Will retry
 	}
 
-	// Generate propagation stamp if required by node
-	if (_outbound_propagation_stamp_cost > 0) {
-		snprintf(buf, sizeof(buf), "  Generating propagation stamp (cost=%u)...", _outbound_propagation_stamp_cost);
-		DEBUG(buf);
-		Bytes stamp = message.generate_propagation_stamp(_outbound_propagation_stamp_cost);
-		if (stamp.size() == 0) {
-			WARNING("  Failed to generate propagation stamp, sending anyway");
+	// Generate propagation stamp if required by node. Async — the
+	// stamper grinds on a worker task so the main loop stays
+	// responsive (cost=16 averages 30s and can hit 2 minutes on bad
+	// luck). First call kicks off the worker and returns false; the
+	// next process_outbound iteration polls and either retries or
+	// proceeds when the stamp lands.
+	if (_outbound_propagation_stamp_cost > 0
+	    && message.propagation_stamp().size() == 0) {
+		if (message.is_propagation_stamp_done()) {
+			Bytes stamp = message.take_propagation_stamp_result();
+			if (stamp.size() == 0) {
+				WARNING("  Async propagation stamp failed, sending anyway");
+				// proceed to pack/send — node may reject, but try.
+			}
+		} else if (message.is_propagation_stamp_running()) {
+			DEBUG("  Propagation stamp still being computed, will retry");
+			return false;
+		} else {
+			snprintf(buf, sizeof(buf),
+			         "  Kicking async propagation stamp (cost=%u)...",
+			         _outbound_propagation_stamp_cost);
+			DEBUG(buf);
+			if (!message.start_propagation_stamp_async(
+			        _outbound_propagation_stamp_cost)) {
+				WARNING("  start_propagation_stamp_async failed (already in flight?), retrying");
+			}
+			return false;  // retry once stamp is ready
 		}
 	}
 

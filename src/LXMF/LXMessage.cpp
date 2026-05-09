@@ -848,6 +848,65 @@ Bytes LXMessage::generate_stamp() {
 	return _stamp;
 }
 
+bool LXMessage::start_propagation_stamp_async(uint8_t target_cost) {
+	if (target_cost == 0) {
+		DEBUG("No propagation stamp cost specified, skipping");
+		return false;
+	}
+	if (!_packed_valid) {
+		pack();
+	}
+	// Compute transient_id (does the encryption work, fast) and cache
+	// the encrypted payload so pack_propagated() reuses it. Mirrors
+	// the head of generate_propagation_stamp() — kept inline so we
+	// don't need a public destination() accessor.
+	Identity dest_identity;
+	if (_destination) {
+		dest_identity = _destination.identity();
+	} else {
+		dest_identity = Identity::recall(_destination_hash);
+	}
+	if (!dest_identity) {
+		ERROR("Cannot start async propagation stamp - destination identity unknown");
+		return false;
+	}
+	Bytes to_encrypt = _packed.mid(Type::Constants::DESTINATION_LENGTH);
+	Bytes encrypted = dest_identity.encrypt(to_encrypt);
+	if (!encrypted || encrypted.size() == 0) {
+		ERROR("Failed to encrypt message for async propagation stamp");
+		return false;
+	}
+	_propagation_encrypted = encrypted;
+	Bytes lxmf_data;
+	lxmf_data << _destination_hash << encrypted;
+	Bytes transient_id = Identity::full_hash(lxmf_data);
+
+	INFO("Starting async propagation stamp for transient_id " +
+	     transient_id.toHex() + " with cost " + std::to_string(target_cost));
+	return LXStamper::start_async(
+		transient_id, target_cost, LXStamper::WORKBLOCK_EXPAND_ROUNDS_PN);
+}
+
+bool LXMessage::is_propagation_stamp_running() const {
+	return LXStamper::is_async_running();
+}
+
+bool LXMessage::is_propagation_stamp_done() const {
+	return LXStamper::is_async_done();
+}
+
+RNS::Bytes LXMessage::take_propagation_stamp_result() {
+	auto [stamp, value] = LXStamper::take_async_result();
+	if (stamp.size() == LXStamper::STAMP_SIZE) {
+		_propagation_stamp = stamp;
+		INFO("Async propagation stamp ready with value " +
+		     std::to_string(value));
+	} else {
+		WARNING("Async propagation stamp finished without a usable result");
+	}
+	return _propagation_stamp;
+}
+
 // Generate propagation stamp for this message
 Bytes LXMessage::generate_propagation_stamp(uint8_t target_cost) {
 	if (target_cost == 0) {

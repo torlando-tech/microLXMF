@@ -200,14 +200,51 @@ namespace LXMF {
 		inline const RNS::Bytes& propagation_stamp() const { return _propagation_stamp; }
 
 		/**
-		 * @brief Generate propagation stamp for this message
+		 * @brief Generate propagation stamp for this message (BLOCKING)
 		 *
 		 * Uses transient_id and PN-specific workblock rounds.
+		 *
+		 * On ESP32 this can block the calling thread for tens of seconds
+		 * to minutes (cost=16 is ~65k SHA256 attempts on average and
+		 * upwards of 300k on bad luck). Prefer the async pair below.
 		 *
 		 * @param target_cost Required stamp cost from propagation node
 		 * @return The generated stamp, or empty on failure
 		 */
 		RNS::Bytes generate_propagation_stamp(uint8_t target_cost);
+
+		/**
+		 * @brief Start async propagation stamp generation
+		 *
+		 * Computes the transient_id (does the encryption work
+		 * synchronously — fast) and then kicks the LXStamper async
+		 * worker. Returns true if the worker was spawned (or, on
+		 * native builds, completed synchronously). Returns false if
+		 * another stamp is already in flight or the encryption step
+		 * failed.
+		 *
+		 * Caller polls is_propagation_stamp_done() / take_propagation_stamp_result().
+		 *
+		 * Only one stamp may be running globally — keep this in mind
+		 * if multiple LXMessage instances are queued for propagation.
+		 */
+		bool start_propagation_stamp_async(uint8_t target_cost);
+
+		/** @brief True while async propagation stamp is in flight. */
+		bool is_propagation_stamp_running() const;
+
+		/** @brief True if async propagation stamp finished. */
+		bool is_propagation_stamp_done() const;
+
+		/**
+		 * @brief Take the async propagation stamp result.
+		 *
+		 * Stores the stamp on the message (so pack_propagated() picks
+		 * it up) and resets the global async slot for the next user.
+		 * Returns the stamp bytes, or empty Bytes if generation failed
+		 * or no result is available.
+		 */
+		RNS::Bytes take_propagation_stamp_result();
 
 		/**
 		 * @brief Get message state

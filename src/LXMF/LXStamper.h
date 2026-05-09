@@ -93,6 +93,46 @@ namespace LXMF {
 			ProgressCallback progress = nullptr);
 
 		/**
+		 * @brief Start async stamp generation on a worker task (ESP32 only)
+		 *
+		 * Spawns a FreeRTOS task that runs generate_stamp() and stores
+		 * the result for later retrieval via take_async_result(). Only
+		 * ONE stamp may be running at a time — returns false if another
+		 * stamp is already in flight.
+		 *
+		 * On non-ESP32 (native test builds), falls back to synchronous
+		 * generation; the same poll API still works.
+		 *
+		 * Caller flow:
+		 *   if (!is_async_done()) {
+		 *       if (!is_async_running()) start_async(id, cost, rounds);
+		 *       return false;  // retry next iteration
+		 *   }
+		 *   auto [stamp, value] = take_async_result();
+		 *
+		 * @return true if a worker was spawned (or sync-completed),
+		 *         false if another stamp is already running.
+		 */
+		static bool start_async(
+			const RNS::Bytes& message_id,
+			uint8_t stamp_cost,
+			uint16_t expand_rounds = WORKBLOCK_EXPAND_ROUNDS);
+
+		/** @brief True while a stamp computation is in flight. */
+		static bool is_async_running();
+
+		/** @brief True if the most recent async stamp finished. */
+		static bool is_async_done();
+
+		/**
+		 * @brief Take the result of the most recent async stamp.
+		 *
+		 * Resets the done state so a new async run can start. Returns
+		 * {empty, 0} if no result is available or the run failed.
+		 */
+		static std::pair<RNS::Bytes, uint8_t> take_async_result();
+
+		/**
 		 * @brief Validate a propagation node stamp
 		 *
 		 * Extracts and validates a stamp from propagation node transient data.
