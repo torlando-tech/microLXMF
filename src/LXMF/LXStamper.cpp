@@ -3,6 +3,7 @@
 #include <Identity.h>
 #include <Cryptography/HKDF.h>
 #include <Cryptography/Random.h>
+#include <RNG.h>
 #include <Utilities/OS.h>
 #include <Log.h>
 
@@ -152,9 +153,15 @@ std::pair<Bytes, uint8_t> LXStamper::generate_stamp(
 			return {{}, 0};
 		}
 
-		// Generate random stamp candidate directly into buffer
-		Bytes stamp = Cryptography::random(STAMP_SIZE);
-		memcpy(stamp_buffer, stamp.data(), STAMP_SIZE);
+		// Generate random stamp candidate DIRECTLY into the stack
+		// buffer. Going through Cryptography::random() returns a Bytes
+		// object whose internal buffer is heap-allocated — and on
+		// pyxis the global operator new is overridden to ps_malloc()
+		// (RNS_PSRAM_ALLOCATOR). At cost=16 we run ~65k iterations and
+		// the per-iteration PSRAM alloc/free pair dominates: stamps
+		// that should take seconds were taking 4+ minutes. Direct
+		// RNG fill keeps the hot path entirely in internal SRAM.
+		RNG.rand(stamp_buffer, STAMP_SIZE);
 		rounds++;
 
 		// OPTIMIZATION: Copy the pre-computed hash state and only hash the stamp
@@ -174,7 +181,9 @@ std::pair<Bytes, uint8_t> LXStamper::generate_stamp(
 				 std::to_string((int)duration) + "s, " + std::to_string(rounds) +
 				 " rounds, " + std::to_string((int)speed) + " rounds/sec");
 
-			return {stamp, value};
+			// Wrap the winning stamp into a Bytes for the return —
+			// only one PSRAM alloc, not 65k.
+			return {Bytes(stamp_buffer, STAMP_SIZE), value};
 		}
 
 		// Progress callback every 1000 rounds
