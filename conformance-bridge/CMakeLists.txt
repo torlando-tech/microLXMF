@@ -41,6 +41,19 @@ add_library(crypto INTERFACE)
 # (The actual include path is appended below, after FetchContent runs.)
 add_library(MsgPack INTERFACE)
 
+# Declare msgpack at the outer scope BEFORE microReticulum's FetchContent
+# runs. microReticulum's CMakeLists also `FetchContent_Declare(msgpack ...)`
+# at v0.4.2 — the de-dupe skips the inner fetch but only if we've already
+# declared with the same name. The critical side effect: ${msgpack_SOURCE_DIR}
+# becomes visible at THIS scope. Without this declaration, microReticulum's
+# nested call populates the variable only in its own subdirectory scope and
+# our patch step below silently no-ops with an empty path.
+FetchContent_Declare(msgpack
+    GIT_REPOSITORY https://github.com/hideakitai/MsgPack.git
+    GIT_TAG v0.4.2
+)
+FetchContent_MakeAvailable(msgpack)
+
 FetchContent_Declare(microreticulum
     GIT_REPOSITORY https://github.com/torlando-tech/microReticulum.git
     GIT_TAG pyxis-fixes-on-0.3.0
