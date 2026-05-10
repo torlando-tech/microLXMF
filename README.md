@@ -32,4 +32,4 @@ microLXMF/
 
 ## License
 
-Copyright (c) 2026 Torlando Tech LLC. Licensed under the [Mozilla Public License 2.0](LICENSE).
+Copyright (c) 2026 Torlando Tech LLC. Licensed under the [GNU General Public License v3.0](LICENSE).
