@@ -337,6 +337,17 @@ namespace LXMF {
 		inline double timestamp() const { return _timestamp; }
 
 		/**
+		 * @brief Pin the timestamp before pack().
+		 *
+		 * pack() only assigns OS::time() when _timestamp is 0.0, so a
+		 * pre-set value flows through into the hashed-part. Used by
+		 * the conformance bridge for deterministic-hash tests
+		 * (test_pinned_timestamp_produces_deterministic_message_hash)
+		 * and by callers that need byte-for-byte reproducibility.
+		 */
+		inline void timestamp(double t) { _timestamp = t; }
+
+		/**
 		 * @brief Get destination hash
 		 */
 		inline const RNS::Bytes& destination_hash() const { return _destination_hash; }

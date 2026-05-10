@@ -112,6 +112,47 @@ LXMRouter::PendingProofSlot LXMRouter::_pending_proofs_pool[LXMRouter::PENDING_P
 // Static pending propagation resources pool definition
 LXMRouter::PropResourceSlot LXMRouter::_pending_prop_resources_pool[LXMRouter::PENDING_PROP_RESOURCES_SIZE];
 
+// Recently-delivered inbound hashes — drop duplicates at dispatch
+// time. Mirrors python LXMRouter's `locally_delivered_transient_ids`
+// (LXMRouter.py:157), but kept in-memory with a fixed-size ring
+// buffer rather than persisted to disk. 64 entries × 32 bytes is
+// 2 KB; on long-running nodes the oldest entries get evicted before
+// becoming a privacy/storage liability. Persistence to MessageStore
+// is a follow-up if conformance later asserts cross-reboot dedup.
+static constexpr size_t RECENT_INBOUND_SIZE = 64;
+static constexpr size_t INBOUND_HASH_SIZE = 32;
+struct RecentInboundSlot {
+	bool in_use = false;
+	uint8_t hash[INBOUND_HASH_SIZE];
+	bool hash_equals(const Bytes& b) const {
+		if (b.size() != INBOUND_HASH_SIZE) return false;
+		return memcmp(hash, b.data(), INBOUND_HASH_SIZE) == 0;
+	}
+	void set_hash(const Bytes& b) {
+		size_t len = std::min(b.size(), INBOUND_HASH_SIZE);
+		memcpy(hash, b.data(), len);
+		if (len < INBOUND_HASH_SIZE) memset(hash + len, 0, INBOUND_HASH_SIZE - len);
+	}
+};
+static RecentInboundSlot _recent_inbound_pool[RECENT_INBOUND_SIZE];
+static size_t _recent_inbound_next = 0;
+
+static bool is_recently_delivered(const Bytes& hash) {
+	for (size_t i = 0; i < RECENT_INBOUND_SIZE; i++) {
+		if (_recent_inbound_pool[i].in_use && _recent_inbound_pool[i].hash_equals(hash)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void mark_recently_delivered(const Bytes& hash) {
+	auto& slot = _recent_inbound_pool[_recent_inbound_next];
+	slot.in_use = true;
+	slot.set_hash(hash);
+	_recent_inbound_next = (_recent_inbound_next + 1) % RECENT_INBOUND_SIZE;
+}
+
 // ============== End Static Fixed Pool Definitions ==============
 
 // ============== Fixed Pool Helper Functions ==============
@@ -774,6 +815,22 @@ void LXMRouter::process_inbound() {
 	DEBUG(buf);
 
 	try {
+		// Drop duplicate inbound — same wire message can arrive twice
+		// over a redundant transport path (loopback test, multi-iface
+		// node) or via opportunistic + propagated delivery of the same
+		// message. Match python LXMRouter.py:1781's behavior: consult
+		// the recently-delivered hash set, skip dispatch on hit.
+		if (is_recently_delivered(message.hash())) {
+			snprintf(buf, sizeof(buf),
+			         "Dropping duplicate inbound %.16s",
+			         message.hash().toHex().c_str());
+			DEBUG(buf);
+			LXMessage dummy;
+			pending_inbound_pop(dummy);
+			return;
+		}
+		mark_recently_delivered(message.hash());
+
 		// Message is already unpacked and validated in on_packet()
 		// Just invoke the delivery callback
 		if (_delivery_callback) {
