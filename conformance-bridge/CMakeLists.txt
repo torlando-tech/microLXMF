@@ -66,7 +66,7 @@ FetchContent_Declare(microreticulum
     # all the prior fixes (Identity ratchet, X25519 clamping, HMAC fix,
     # PKCS7, Resource RX + per-part receiver progress, link-proof
     # callback, libbz2 vendor).
-    GIT_TAG 3ee2bd8b66dc73127f5f76739a44aa84cc7b2c0e
+    GIT_TAG 3ee2bd8337801173ed107c8d1deb6865739d37ff
 )
 FetchContent_MakeAvailable(microreticulum)
 
