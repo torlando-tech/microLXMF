@@ -100,26 +100,53 @@ target_include_directories(MsgPack INTERFACE ${msgpack_SOURCE_DIR})
 # uses `dict[int, Any]` on the wire — to splice arbitrary msgpack values
 # into the stream without LXMessage knowing the value type, we splice
 # pre-encoded bytes via packRawBytes; on decode we use Unpacker's
-# `indices` to capture each key+value byte span. The patch is
-# idempotent: only rewrites the modifiers when they're still default-
-# private from the upstream tag.
+# `indices` to capture each key+value byte span.
+#
+# Idempotent: detects the already-patched state by grepping for the
+# patch marker comment, skips if already applied. Uses a real ASCII
+# newline (not the `\n` literal in a quoted argument, which doesn't
+# round-trip reliably across CMake versions when re-stringified through
+# string(REPLACE)) to make the multi-line match work in CI.
+string(ASCII 10 _PATCH_NL)
+set(_PATCH_MARKER "// patched-by-microlxmf")
+
 if(EXISTS "${msgpack_SOURCE_DIR}/MsgPack/Packer.h")
     file(READ "${msgpack_SOURCE_DIR}/MsgPack/Packer.h" _packer_content)
-    string(REPLACE
-        "    private:\n        void packRawByte"
-        "    public:  // patched by microLXMF conformance-bridge CMakeLists\n        void packRawByte"
-        _packer_patched "${_packer_content}")
-    if(NOT "${_packer_patched}" STREQUAL "${_packer_content}")
+    if(NOT _packer_content MATCHES "${_PATCH_MARKER}")
+        # v0.4.2 has the only `private:` block in this file at line ~963,
+        # immediately followed by `void packRawByte`. Match-and-replace it.
+        set(_packer_target "    private:${_PATCH_NL}        void packRawByte")
+        set(_packer_replacement "    public:  ${_PATCH_MARKER}${_PATCH_NL}        void packRawByte")
+        string(REPLACE "${_packer_target}" "${_packer_replacement}"
+                       _packer_patched "${_packer_content}")
+        if("${_packer_patched}" STREQUAL "${_packer_content}")
+            message(FATAL_ERROR
+                "Failed to patch ${msgpack_SOURCE_DIR}/MsgPack/Packer.h — "
+                "expected `    private:\\n        void packRawByte` block "
+                "from hideakitai/MsgPack v0.4.2 not found. Did the upstream "
+                "tag change?")
+        endif()
         file(WRITE "${msgpack_SOURCE_DIR}/MsgPack/Packer.h" "${_packer_patched}")
     endif()
 endif()
 if(EXISTS "${msgpack_SOURCE_DIR}/MsgPack/Unpacker.h")
     file(READ "${msgpack_SOURCE_DIR}/MsgPack/Unpacker.h" _unpacker_content)
-    string(REPLACE
-        "    class Unpacker {\n        uint8_t* raw_data"
-        "    class Unpacker {\n    public:  // patched by microLXMF conformance-bridge CMakeLists\n        uint8_t* raw_data"
-        _unpacker_patched "${_unpacker_content}")
-    if(NOT "${_unpacker_patched}" STREQUAL "${_unpacker_content}")
+    if(NOT _unpacker_content MATCHES "${_PATCH_MARKER}")
+        # `class Unpacker {` defaults to private, so `raw_data` and
+        # `indices` (declared right after the opening brace) are private.
+        # Inject `public:` between the brace and the first member.
+        set(_unpacker_target "    class Unpacker {${_PATCH_NL}        uint8_t* raw_data")
+        set(_unpacker_replacement
+            "    class Unpacker {${_PATCH_NL}    public:  ${_PATCH_MARKER}${_PATCH_NL}        uint8_t* raw_data")
+        string(REPLACE "${_unpacker_target}" "${_unpacker_replacement}"
+                       _unpacker_patched "${_unpacker_content}")
+        if("${_unpacker_patched}" STREQUAL "${_unpacker_content}")
+            message(FATAL_ERROR
+                "Failed to patch ${msgpack_SOURCE_DIR}/MsgPack/Unpacker.h — "
+                "expected `class Unpacker {\\n        uint8_t* raw_data` "
+                "block from hideakitai/MsgPack v0.4.2 not found. Did the "
+                "upstream tag change?")
+        endif()
         file(WRITE "${msgpack_SOURCE_DIR}/MsgPack/Unpacker.h" "${_unpacker_patched}")
     endif()
 endif()
