@@ -1,12 +1,16 @@
 # microLXMF
 
+[![Conformance](https://github.com/torlando-tech/microLXMF/actions/workflows/conformance.yml/badge.svg)](https://github.com/torlando-tech/microLXMF/actions/workflows/conformance.yml)
+
 C++ implementation of [LXMF](https://github.com/markqvist/LXMF) (Lightweight Extensible Message Format) layered on top of [attermann/microReticulum](https://github.com/attermann/microReticulum). Sister library to [LXMF-swift](https://github.com/torlando-tech/LXMF-swift) and [LXMF-kt](https://github.com/torlando-tech/LXMF-kt).
 
 Targets ESP32 (Arduino framework) and host (POSIX) builds; the same source tree builds in both.
 
 ## Status
 
-Bootstrap. Sources extracted from [pyxis](https://github.com/torlando-tech/pyxis)' vendored fork (originally derived from `torlando-tech/microReticulum:feat/t-deck`'s LXMF subtree) and being aligned to vanilla `attermann/microReticulum @ 0.3.0`. Conformance bridge under construction; expect interop bugs to surface against the python LXMF reference until the lxmf-conformance suite is green.
+Cross-impl conformance against the python LXMF reference passes the announce, opportunistic, direct (small + resource), attachments, and combined surfaces — see [`conformance-bridge/README.md`](conformance-bridge/README.md) for the per-suite breakdown. Propagation-via-`lxmd` is the remaining gap, tracked in [#1](https://github.com/torlando-tech/microLXMF/issues/1).
+
+Sources were extracted from [pyxis](https://github.com/torlando-tech/pyxis)' vendored fork (originally derived from `torlando-tech/microReticulum:feat/t-deck`'s LXMF subtree) and aligned to vanilla `attermann/microReticulum @ 0.3.0`.
 
 ## Layout
 
@@ -20,9 +24,11 @@ microLXMF/
 │       ├── MessageStore.{h,cpp}
 │       ├── PropagationNodeManager.{h,cpp}
 │       └── Type.h
-├── test/                    # PlatformIO native unit tests
 ├── conformance-bridge/      # JSON-RPC stdio bridge for lxmf-conformance
-└── library.json             # PlatformIO manifest
+│   └── tests/               # native host smoke tests for individual components
+├── .github/workflows/       # CI: cross-impl conformance against python reference
+├── library.json             # PlatformIO manifest
+└── platformio.ini           # for native-host development builds only
 ```
 
 ## Dependencies

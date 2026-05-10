@@ -360,34 +360,6 @@ LXMessage LXMessage::unpack_from_bytes(const Bytes& lxmf_bytes, Type::Message::M
 		const uint8_t* fields_end = fields_p + packed_payload.size();
 		fields_p += unpacker.indices[unpacker.index()];
 
-		auto skip_msgpack = [](const uint8_t*& p, const uint8_t* end) -> bool {
-			if (p >= end) return false;
-			uint8_t b = *p++;
-			auto rd = [&](size_t n, uint64_t& out) -> bool {
-				if (p + n > end) return false;
-				out = 0;
-				for (size_t i = 0; i < n; ++i) out = (out << 8) | *p++;
-				return true;
-			};
-			if (b <= 0x7f || b >= 0xe0) return true;            // fixint
-			if ((b & 0xe0) == 0xa0) {                            // fixstr
-				size_t n = b & 0x1f;
-				if (p + n > end) return false;
-				p += n; return true;
-			}
-			if ((b & 0xf0) == 0x90) {                            // fixarray
-				size_t n = b & 0x0f;
-				for (size_t i = 0; i < n; ++i) {
-					// Recursive skip via re-entry. Inline a small
-					// stack-managed loop using the same `b` decoder
-					// machinery via static lambda rebinding.
-					return false;  // — placeholder; will be replaced below
-				}
-				return true;
-			}
-			return false;  // also placeholder
-		};
-
 		// Recursive skip — std::function captures itself for
 		// arbitrarily-nested array/map.
 		std::function<bool(const uint8_t*&, const uint8_t*)> skip;
@@ -634,59 +606,6 @@ bool LXMessage::validate_signature() {
 		_signature_validated = false;
 		_unverified_reason = Type::Message::SIGNATURE_INVALID;
 		WARNING("Signature validation failed");
-		return false;
-	}
-}
-
-// Send the message via a link
-bool LXMessage::send_via_link(const Link& link) {
-	INFO("Sending LXMF message via link");
-
-	// Ensure message is packed
-	if (!_packed_valid) {
-		pack();
-	}
-
-	// Check that link is active
-	if (!link || link.status() != RNS::Type::Link::ACTIVE) {
-		ERROR("Cannot send message - link is not active");
-		return false;
-	}
-
-	_state = Type::Message::SENDING;
-
-	try {
-		if (_representation == Type::Message::PACKET) {
-			// Send as single packet over link
-			INFO("  Sending as single packet (" + std::to_string(_packed.size()) + " bytes)");
-
-			Packet packet(link, _packed);
-			packet.send();
-
-			_state = Type::Message::SENT;
-			INFO("Message sent successfully as packet");
-			return true;
-
-		} else if (_representation == Type::Message::RESOURCE) {
-			// Send as resource over link
-			INFO("  Sending as resource (" + std::to_string(_packed.size()) + " bytes)");
-
-			// TODO: Implement resource transfer with callbacks
-			// For now, we'll create the resource but won't set callbacks
-			Resource resource(_packed, link);
-
-			_state = Type::Message::SENT;
-			INFO("Message resource transfer initiated");
-			return true;
-
-		} else {
-			ERROR("Unknown message representation");
-			_state = Type::Message::FAILED;
-			return false;
-		}
-	} catch (const std::exception& e) {
-		ERROR("Failed to send message: " + std::string(e.what()));
-		_state = Type::Message::FAILED;
 		return false;
 	}
 }

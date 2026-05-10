@@ -14,7 +14,7 @@
       "maintainer": true
     }
   ],
-  "license": "MPL-2.0",
+  "license": "GPL-3.0-only",
   "frameworks": ["arduino", "*"],
   "platforms": "*",
   "dependencies": [

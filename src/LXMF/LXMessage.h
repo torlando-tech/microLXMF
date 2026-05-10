@@ -115,18 +115,6 @@ namespace LXMF {
 		bool validate_signature();
 
 		/**
-		 * @brief Send the message via a link
-		 *
-		 * For DIRECT delivery method:
-		 * - If packed size <= 319 bytes: send as single packet
-		 * - If packed size > 319 bytes: send as resource
-		 *
-		 * @param link Active link to send over
-		 * @return true if send initiated successfully
-		 */
-		bool send_via_link(const RNS::Link& link);
-
-		/**
 		 * @brief Pack the message for PROPAGATED delivery
 		 *
 		 * Creates the LXMF propagation format:
