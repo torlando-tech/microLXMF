@@ -210,18 +210,6 @@ REGISTER_COMMAND(lxmf_get_message_progress, {
     return bridge::json{{"progress", rt.get_message_progress(to_rns(hash))}};
 })
 
-// Returns how many times the resource progress_callback has fired
-// for the given message. Conformance tests assert count >= 2 to
-// prove the callback wires up correctly without depending on poll
-// timing — see Runtime.cpp's progress callback for the rationale.
-REGISTER_COMMAND(lxmf_get_message_progress_tick_count, {
-    auto& rt = bridge::Runtime::instance();
-    auto hash = bridge::hex_param(p, "message_hash");
-    return bridge::json{
-        {"count", (uint64_t)rt.get_message_progress_tick_count(to_rns(hash))},
-    };
-})
-
 REGISTER_COMMAND(lxmf_shutdown, {
     (void)p;
     auto& rt = bridge::Runtime::instance();

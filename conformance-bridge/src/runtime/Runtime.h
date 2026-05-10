@@ -130,14 +130,6 @@ public:
     // PACKET path, which does not tick progress).
     float get_message_progress(const RNS::Bytes& message_hash);
 
-    // Number of times the resource progress_callback has fired for the
-    // given message. Lets conformance tests assert "callback fired
-    // multiple times during transfer" without depending on poll timing
-    // — on fast loopback the entire transfer can complete before a
-    // polling test can observe any intermediate progress value, but
-    // the tick count is captured deterministically per-firing.
-    uint32_t get_message_progress_tick_count(const RNS::Bytes& message_hash);
-
     // Identity hashes (LXMF semantics).
     RNS::Bytes identity_hash() const;
     RNS::Bytes delivery_destination_hash() const;
@@ -186,7 +178,6 @@ private:
     std::mutex _outbound_mutex;
     std::map<RNS::Bytes, LXMF::Type::Message::State> _outbound_states;
     std::map<RNS::Bytes, float> _outbound_progress;
-    std::map<RNS::Bytes, uint32_t> _outbound_progress_tick_count;
 
     // Top-level mutex around init/shutdown + interface registration.
     std::mutex _lifecycle_mutex;
