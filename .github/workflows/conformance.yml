@@ -47,6 +47,13 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: torlando-tech/lxmf-conformance
+          # TODO: drop after `feat/progress-tick-count` lands on
+          # lxmf-conformance main. The branch carries the new
+          # `lxmf_get_message_progress_tick_count` command + the
+          # test_resource_progress assertion that depends on it; the
+          # microlxmf bridge command added in this PR pairs with that
+          # lxmf-conformance change.
+          ref: feat/progress-tick-count
           path: lxmf-conformance
 
       - name: Checkout Reticulum (Python reference)

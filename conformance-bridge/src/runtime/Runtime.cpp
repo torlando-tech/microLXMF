@@ -173,6 +173,14 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
     _router->register_progress_callback([this](LXMF::LXMessage& m) {
         std::lock_guard<std::mutex> g(_outbound_mutex);
         _outbound_progress[m.hash()] = m.progress();
+        // Per-firing counter — `lxmf_get_message_progress_tick_count`
+        // exposes this so conformance tests can prove the progress
+        // callback fired multiple times during transfer without
+        // depending on polling beating the worker thread (on fast
+        // loopback the entire transfer can complete before a 10 ms
+        // poll observes any intermediate value, but every per-part
+        // tick still increments this counter).
+        _outbound_progress_tick_count[m.hash()] += 1;
     });
 
     // Worker thread.
@@ -411,6 +419,13 @@ float Runtime::get_message_progress(const Bytes& message_hash) {
         // Convention: -1.0 signals "no progress observed".
         return -1.0f;
     }
+    return it->second;
+}
+
+uint32_t Runtime::get_message_progress_tick_count(const Bytes& message_hash) {
+    std::lock_guard<std::mutex> g(_outbound_mutex);
+    auto it = _outbound_progress_tick_count.find(message_hash);
+    if (it == _outbound_progress_tick_count.end()) return 0;
     return it->second;
 }
 
