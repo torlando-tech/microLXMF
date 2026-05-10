@@ -56,7 +56,16 @@ FetchContent_MakeAvailable(msgpack)
 
 FetchContent_Declare(microreticulum
     GIT_REPOSITORY https://github.com/torlando-tech/microReticulum.git
-    GIT_TAG pyxis-fixes-on-0.3.0
+    # Pinned to a SHA rather than the `pyxis-fixes-on-0.3.0` branch so CI
+    # builds are reproducible AND so a force-fetch is guaranteed when the
+    # SHA bumps (CMake FetchContent caches branch refs across configure
+    # runs in some setups, which made it tricky to verify the actual
+    # commit being compiled). Bump this when landing a new microReticulum
+    # patch on the fork. Current pin = c3584b3 — sender progress callback
+    # fires per-part rather than per-batch, plus all the prior fixes
+    # (Identity ratchet, X25519 clamping, HMAC fix, PKCS7, Resource RX,
+    # link-proof callback, libbz2 vendor).
+    GIT_TAG c3584b3bbd9be8fb140b653e70b0c77fbe5cbcf8
 )
 FetchContent_MakeAvailable(microreticulum)
 
