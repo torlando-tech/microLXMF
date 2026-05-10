@@ -1,0 +1,145 @@
+name: Conformance (vs Python reference)
+
+# Runs the LXMF cross-impl conformance suite against THIS repo's
+# conformance-bridge binary, paired with the Python reference bridge.
+#
+# Modeled after LXMF-kt/.github/workflows/conformance.yml — see that file's
+# header for why per-impl cross-validation lives in each impl's own repo
+# rather than in lxmf-conformance.
+#
+# Coverage: every (sender_impl, receiver_impl) pair drawn from
+# {python, microlxmf}. The propagation suite is skipped — microLXMF's
+# Resource transfer to lxmd does not yet conclude (see
+# conformance-bridge/README.md, "Resource transfer to lxmd doesn't
+# conclude — needs upstream propagation upload protocol debugging").
+# Tracking: https://github.com/torlando-tech/microLXMF/issues/1
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      python_lxmf_ref:
+        description: "markqvist/LXMF git ref to test against"
+        default: "master"
+        required: false
+      python_rns_ref:
+        description: "markqvist/Reticulum git ref to test against"
+        default: "master"
+        required: false
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout microLXMF
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: microLXMF
+
+      - name: Checkout lxmf-conformance
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: torlando-tech/lxmf-conformance
+          path: lxmf-conformance
+
+      - name: Checkout Reticulum (Python reference)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: markqvist/Reticulum
+          ref: ${{ github.event.inputs.python_rns_ref || 'master' }}
+          path: Reticulum
+
+      - name: Checkout LXMF (Python reference)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: markqvist/LXMF
+          ref: ${{ github.event.inputs.python_lxmf_ref || 'master' }}
+          path: LXMF
+
+      - name: Install build deps
+        # CMake + a recent C++17 toolchain. ubuntu-latest images already
+        # ship cmake >= 3.22 and gcc >= 11, but installing explicitly
+        # keeps us covered if the runner image drifts.
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential ninja-build
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python deps
+        # The Python reference bridge in lxmf-conformance imports RNS +
+        # LXMF from PYTHON_RNS_PATH / PYTHON_LXMF_PATH (set in the test
+        # env below) and shells out to `lxmd` for propagation tests, so
+        # we install the runtime deps both libraries need at import time.
+        # `lxmd` itself is a console_script provided by the LXMF source
+        # checkout — installed via `pip install -e $LXMF` below. We skip
+        # propagation in the test run, but lxmd is harmless to install.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-timeout cryptography pyserial msgpack
+          pip install -e ${{ github.workspace }}/LXMF
+
+      - name: Build microLXMF conformance bridge
+        # CMake FetchContents microReticulum (torlando-tech fork +
+        # pyxis-fixes-on-0.3.0 branch — vanilla 0.3.0 plus three
+        # PR-ready Cryptography fixes), microStore (POSIX backend),
+        # and the hideakitai/MsgPack header-only deps. The build
+        # produces conformance-bridge/build/microLXMFBridge — same
+        # path the conformance repo's default detection looks at via
+        # CONFORMANCE_MICROLXMF_BRIDGE_CMD.
+        working-directory: microLXMF/conformance-bridge
+        run: |
+          cmake -S . -B build -G Ninja
+          cmake --build build --target microLXMFBridge --parallel
+
+      - name: Smoke-test bridge binary
+        # Sanity check before running pytest: bridge starts, prints
+        # READY, and exits cleanly on EOF. Prevents a confusing
+        # "all tests timed out" run if the binary is broken.
+        working-directory: microLXMF/conformance-bridge
+        run: |
+          echo "" | timeout 5s ./build/microLXMFBridge | head -5 || true
+          test -x ./build/microLXMFBridge
+
+      - name: Run conformance suite (python ↔ microlxmf)
+        working-directory: lxmf-conformance
+        env:
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
+          # Pin the microlxmf bridge command explicitly so detection
+          # doesn't depend on relative-path conventions inside the
+          # GitHub Actions checkout layout.
+          CONFORMANCE_MICROLXMF_BRIDGE_CMD: >-
+            ${{ github.workspace }}/microLXMF/conformance-bridge/build/microLXMFBridge
+        # --impls python,microlxmf generates every (sender × receiver)
+        # combination across the two impls. Propagation tests are
+        # skipped via --ignore until lxmd Resource-transfer interop
+        # lands; see conformance-bridge/README.md.
+        run: |
+          python -m pytest tests/ \
+            --ignore=tests/test_propagation.py \
+            -v --tb=short \
+            --impls python,microlxmf
+
+      - name: Upload bridge build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: conformance-bridge-build
+          path: |
+            microLXMF/conformance-bridge/build/CMakeFiles/CMakeOutput.log
+            microLXMF/conformance-bridge/build/CMakeFiles/CMakeError.log
+            microLXMF/conformance-bridge/build/CMakeCache.txt
+          if-no-files-found: ignore
