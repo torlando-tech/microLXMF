@@ -74,5 +74,6 @@ int int_param_or(const json& p, const char* key, int def);
 std::string str_param(const json& p, const char* key);
 std::string str_param_or(const json& p, const char* key, const std::string& def);
 bool bool_param(const json& p, const char* key);
+double double_param_or(const json& p, const char* key, double def);
 
 }  // namespace bridge

@@ -68,6 +68,20 @@ namespace LXMF {
 		using FailedCallback = std::function<void(LXMessage& message)>;
 
 		/**
+		 * @brief Callback for resource transfer progress
+		 *
+		 * Fires whenever the underlying RNS::Resource ticks its
+		 * progress, blended into the LXMessage-level 0.0–1.0 progress
+		 * field (mirroring python LXMF's
+		 * `_LXMessage__update_transfer_progress`). PACKET-representation
+		 * messages do not fire this callback — they go straight from
+		 * SENT to DELIVERED.
+		 *
+		 * @param message The message whose progress changed
+		 */
+		using ProgressCallback = std::function<void(LXMessage& message)>;
+
+		/**
 		 * @brief Callback for sync completion
 		 * @param messages_received Number of messages received from propagation node
 		 */
@@ -139,6 +153,17 @@ namespace LXMF {
 		 * @param callback Function to call when message fails
 		 */
 		void register_failed_callback(FailedCallback callback);
+
+		/**
+		 * @brief Register callback for resource transfer progress
+		 *
+		 * Called whenever an in-flight resource transfer reports a
+		 * progress tick. The associated `LXMessage::progress()` is
+		 * already updated when the callback fires.
+		 *
+		 * @param callback Function to call on progress updates
+		 */
+		void register_progress_callback(ProgressCallback callback);
 
 		/**
 		 * @brief Queue an outbound message for delivery
@@ -624,6 +649,11 @@ namespace LXMF {
 		// Handle delivery proof for DIRECT messages (called from link packet callback)
 		static void handle_direct_proof(const RNS::Bytes& message_hash);
 
+		// Handle resource progress tick — fires every registered router's
+		// _progress_callback with a stub LXMessage carrying the new progress.
+		// Called from file-scope static_outbound_resource_progress.
+		static void handle_resource_progress(const RNS::Bytes& message_hash, float progress);
+
 	private:
 
 		// Callbacks
@@ -631,6 +661,7 @@ namespace LXMF {
 		SentCallback _sent_callback;
 		DeliveredCallback _delivered_callback;
 		FailedCallback _failed_callback;
+		ProgressCallback _progress_callback;
 
 		// Announce settings
 		uint32_t _announce_interval = 0;           // Seconds (0 = disabled)

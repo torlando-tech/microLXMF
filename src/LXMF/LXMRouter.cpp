@@ -112,6 +112,47 @@ LXMRouter::PendingProofSlot LXMRouter::_pending_proofs_pool[LXMRouter::PENDING_P
 // Static pending propagation resources pool definition
 LXMRouter::PropResourceSlot LXMRouter::_pending_prop_resources_pool[LXMRouter::PENDING_PROP_RESOURCES_SIZE];
 
+// Recently-delivered inbound hashes — drop duplicates at dispatch
+// time. Mirrors python LXMRouter's `locally_delivered_transient_ids`
+// (LXMRouter.py:157), but kept in-memory with a fixed-size ring
+// buffer rather than persisted to disk. 64 entries × 32 bytes is
+// 2 KB; on long-running nodes the oldest entries get evicted before
+// becoming a privacy/storage liability. Persistence to MessageStore
+// is a follow-up if conformance later asserts cross-reboot dedup.
+static constexpr size_t RECENT_INBOUND_SIZE = 64;
+static constexpr size_t INBOUND_HASH_SIZE = 32;
+struct RecentInboundSlot {
+	bool in_use = false;
+	uint8_t hash[INBOUND_HASH_SIZE];
+	bool hash_equals(const Bytes& b) const {
+		if (b.size() != INBOUND_HASH_SIZE) return false;
+		return memcmp(hash, b.data(), INBOUND_HASH_SIZE) == 0;
+	}
+	void set_hash(const Bytes& b) {
+		size_t len = std::min(b.size(), INBOUND_HASH_SIZE);
+		memcpy(hash, b.data(), len);
+		if (len < INBOUND_HASH_SIZE) memset(hash + len, 0, INBOUND_HASH_SIZE - len);
+	}
+};
+static RecentInboundSlot _recent_inbound_pool[RECENT_INBOUND_SIZE];
+static size_t _recent_inbound_next = 0;
+
+static bool is_recently_delivered(const Bytes& hash) {
+	for (size_t i = 0; i < RECENT_INBOUND_SIZE; i++) {
+		if (_recent_inbound_pool[i].in_use && _recent_inbound_pool[i].hash_equals(hash)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void mark_recently_delivered(const Bytes& hash) {
+	auto& slot = _recent_inbound_pool[_recent_inbound_next];
+	slot.in_use = true;
+	slot.set_hash(hash);
+	_recent_inbound_next = (_recent_inbound_next + 1) % RECENT_INBOUND_SIZE;
+}
+
 // ============== End Static Fixed Pool Definitions ==============
 
 // ============== Fixed Pool Helper Functions ==============
@@ -257,6 +298,27 @@ static void static_resource_concluded_callback(const Resource& resource) {
 		}
 	}
 	WARNING("static_resource_concluded_callback: no registered router");
+}
+
+// Static callback for outbound resource progress (sending).
+// Called whenever the underlying RNS::Resource ticks its progress mid-flight.
+// Looks up the matching message hash, blends the resource's 0–1 progress
+// into the LXMF-level 0.10–1.0 band (mirroring python LXMF's
+// `_LXMessage__update_transfer_progress`), and dispatches to the public
+// LXMRouter::handle_resource_progress which has private-member access
+// to fire every registered router's _progress_callback.
+static void static_outbound_resource_progress(const Resource& resource) {
+	OutboundResourceSlot* slot = find_outbound_resource_slot(resource.hash());
+	if (!slot) {
+		// Resource not tracked — likely an LXMRouter we don't own.
+		return;
+	}
+	Bytes message_hash = slot->message_hash_bytes();
+	float resource_progress = resource.get_progress();
+	if (resource_progress < 0.0f) resource_progress = 0.0f;
+	if (resource_progress > 1.0f) resource_progress = 1.0f;
+	float lxmf_progress = 0.10f + 0.90f * resource_progress;
+	LXMRouter::handle_resource_progress(message_hash, lxmf_progress);
 }
 
 // Static callback for outbound resource concluded (sending)
@@ -509,6 +571,11 @@ void LXMRouter::register_failed_callback(FailedCallback callback) {
 	DEBUG("Failed callback registered");
 }
 
+void LXMRouter::register_progress_callback(ProgressCallback callback) {
+	_progress_callback = callback;
+	DEBUG("Progress callback registered");
+}
+
 // Queue outbound message
 void LXMRouter::handle_outbound(LXMessage& message) {
 	INFO("Handling outbound LXMF message");
@@ -748,6 +815,22 @@ void LXMRouter::process_inbound() {
 	DEBUG(buf);
 
 	try {
+		// Drop duplicate inbound — same wire message can arrive twice
+		// over a redundant transport path (loopback test, multi-iface
+		// node) or via opportunistic + propagated delivery of the same
+		// message. Match python LXMRouter.py:1781's behavior: consult
+		// the recently-delivered hash set, skip dispatch on hit.
+		if (is_recently_delivered(message.hash())) {
+			snprintf(buf, sizeof(buf),
+			         "Dropping duplicate inbound %.16s",
+			         message.hash().toHex().c_str());
+			DEBUG(buf);
+			LXMessage dummy;
+			pending_inbound_pop(dummy);
+			return;
+		}
+		mark_recently_delivered(message.hash());
+
 		// Message is already unpacked and validated in on_packet()
 		// Just invoke the delivery callback
 		if (_delivery_callback) {
@@ -1120,12 +1203,16 @@ bool LXMRouter::send_via_link(LXMessage& message, Link& link) {
 			return true;
 
 		} else if (message.representation() == Type::Message::RESOURCE) {
-			// Send as resource over link with concluded callback
+			// Send as resource over link with concluded + progress callbacks
 			snprintf(buf, sizeof(buf), "  Sending as resource (%zu bytes)", message.packed_size());
 			INFO(buf);
 
-			// Create resource with our callback to track completion
-			Resource resource(message.packed(), link, true, true, static_outbound_resource_concluded);
+			// Create resource with our concluded callback (fires on COMPLETE
+			// or FAILED) and progress callback (fires on each part transferred,
+			// blended into the message-level 0.10–1.0 progress band).
+			Resource resource(message.packed(), link, true, true,
+			                  static_outbound_resource_concluded,
+			                  static_outbound_resource_progress);
 
 			// Track this resource so we can match the callback to the message
 			if (resource.hash()) {
@@ -1224,6 +1311,31 @@ bool LXMRouter::send_opportunistic(LXMessage& message, const Identity& dest_iden
 }
 
 // Handle delivery proof for DIRECT messages
+void LXMRouter::handle_resource_progress(const Bytes& message_hash, float progress) {
+	// Match handle_direct_proof's dedup pattern — a single LXMRouter can
+	// appear in the registry under multiple slots (one per registered
+	// destination); fire its _progress_callback at most once per tick.
+	LXMRouter* notified_routers[ROUTER_REGISTRY_SIZE];
+	size_t notified_count = 0;
+
+	for (size_t i = 0; i < ROUTER_REGISTRY_SIZE; i++) {
+		if (!_router_registry_pool[i].in_use) continue;
+		LXMRouter* router = _router_registry_pool[i].router;
+		if (!router || !router->_progress_callback) continue;
+		bool already_notified = false;
+		for (size_t j = 0; j < notified_count; j++) {
+			if (notified_routers[j] == router) { already_notified = true; break; }
+		}
+		if (already_notified) continue;
+		notified_routers[notified_count++] = router;
+		Bytes empty_hash;
+		LXMessage msg(empty_hash, empty_hash);
+		msg.hash(message_hash);
+		msg.progress(progress);
+		router->_progress_callback(msg);
+	}
+}
+
 void LXMRouter::handle_direct_proof(const Bytes& message_hash) {
 	char buf[128];
 	snprintf(buf, sizeof(buf), "Processing DIRECT delivery proof for message %.16s...", message_hash.toHex().c_str());

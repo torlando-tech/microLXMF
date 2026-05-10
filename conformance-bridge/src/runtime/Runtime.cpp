@@ -170,6 +170,10 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
         std::lock_guard<std::mutex> g(_outbound_mutex);
         _outbound_states[m.hash()] = LXMF::Type::Message::FAILED;
     });
+    _router->register_progress_callback([this](LXMF::LXMessage& m) {
+        std::lock_guard<std::mutex> g(_outbound_mutex);
+        _outbound_progress[m.hash()] = m.progress();
+    });
 
     // Worker thread.
     _stopping.store(false);
@@ -269,7 +273,8 @@ static Bytes send_message_internal(
     const Runtime::FieldList& fields,
     LXMF::Type::Message::Method method,
     std::mutex& outbound_mutex,
-    std::map<Bytes, LXMF::Type::Message::State>& outbound_states)
+    std::map<Bytes, LXMF::Type::Message::State>& outbound_states,
+    double timestamp = 0.0)
 {
     Identity recipient_identity = Identity::recall(dest_hash);
     Destination dest{RNS::Type::NONE};
@@ -292,6 +297,13 @@ static Bytes send_message_internal(
     for (const auto& kv : fields) {
         m.fields_set(kv.first, kv.second);
     }
+    // Pin the timestamp BEFORE pack(). LXMessage::pack() only assigns
+    // OS::time() when _timestamp is still 0.0, so a non-zero pre-set
+    // value flows into the hashed-part. Mirrors python bridge's
+    // `message.timestamp = float(forced_timestamp)` at lxmf_python.py:735.
+    if (timestamp != 0.0) {
+        m.timestamp(timestamp);
+    }
     m.pack();
     Bytes hash = m.hash();
     {
@@ -305,31 +317,34 @@ static Bytes send_message_internal(
 Bytes Runtime::send_opportunistic(const Bytes& dest_hash,
                                   const std::string& content,
                                   const std::string& title,
-                                  const FieldList& fields) {
+                                  const FieldList& fields,
+                                  double timestamp) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
     return send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::OPPORTUNISTIC,
-                                 _outbound_mutex, _outbound_states);
+                                 _outbound_mutex, _outbound_states, timestamp);
 }
 
 Bytes Runtime::send_direct(const Bytes& dest_hash,
                            const std::string& content,
                            const std::string& title,
-                           const FieldList& fields) {
+                           const FieldList& fields,
+                           double timestamp) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
     return send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::DIRECT,
-                                 _outbound_mutex, _outbound_states);
+                                 _outbound_mutex, _outbound_states, timestamp);
 }
 
 Bytes Runtime::send_propagated(const Bytes& dest_hash,
                                const std::string& content,
                                const std::string& title,
-                               const FieldList& fields) {
+                               const FieldList& fields,
+                               double timestamp) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
     return send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::PROPAGATED,
-                                 _outbound_mutex, _outbound_states);
+                                 _outbound_mutex, _outbound_states, timestamp);
 }
 
 void Runtime::request_path(const Bytes& destination_hash) {
@@ -396,6 +411,18 @@ std::string Runtime::get_message_state(const Bytes& message_hash) {
     auto it = _outbound_states.find(message_hash);
     if (it == _outbound_states.end()) return "unknown";
     return state_to_string(it->second);
+}
+
+float Runtime::get_message_progress(const Bytes& message_hash) {
+    std::lock_guard<std::mutex> g(_outbound_mutex);
+    auto it = _outbound_progress.find(message_hash);
+    if (it == _outbound_progress.end()) {
+        // No progress recorded — either we haven't sent this message,
+        // or it took the PACKET path (small payloads, no resource).
+        // Convention: -1.0 signals "no progress observed".
+        return -1.0f;
+    }
+    return it->second;
 }
 
 Bytes Runtime::identity_hash() const {

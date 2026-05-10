@@ -244,6 +244,24 @@ namespace LXMF {
 		 */
 		inline void state(Type::Message::State state) { _state = state; }
 
+		/**
+		 * @brief Current transfer progress in [0.0, 1.0]
+		 *
+		 * Mirrors python LXMF's `LXMessage.progress` field. Updated as
+		 * the message moves through the outbound state machine: 0.10
+		 * once the link is up and the resource has been advertised,
+		 * blended with `Resource::get_progress()` while the resource
+		 * transfer is in flight (0.10 + 0.90 × resource_progress), and
+		 * 1.0 on DELIVERED / FAILED. PACKET-representation messages
+		 * jump directly to 1.0 on proof.
+		 */
+		inline float progress() const { return _progress; }
+
+		/**
+		 * @brief Set current transfer progress (LXMRouter use only)
+		 */
+		inline void progress(float p) { _progress = p; }
+
 		inline int delivery_attempts() const { return _delivery_attempts; }
 		inline void increment_delivery_attempts() { _delivery_attempts++; }
 
@@ -317,6 +335,17 @@ namespace LXMF {
 		 * @brief Get timestamp
 		 */
 		inline double timestamp() const { return _timestamp; }
+
+		/**
+		 * @brief Pin the timestamp before pack().
+		 *
+		 * pack() only assigns OS::time() when _timestamp is 0.0, so a
+		 * pre-set value flows through into the hashed-part. Used by
+		 * the conformance bridge for deterministic-hash tests
+		 * (test_pinned_timestamp_produces_deterministic_message_hash)
+		 * and by callers that need byte-for-byte reproducibility.
+		 */
+		inline void timestamp(double t) { _timestamp = t; }
 
 		/**
 		 * @brief Get destination hash
@@ -417,6 +446,7 @@ namespace LXMF {
 
 		// Message state
 		Type::Message::State _state = Type::Message::GENERATING;
+		float _progress = 0.0f;
 		int _delivery_attempts = 0;
 
 		// Signature validation

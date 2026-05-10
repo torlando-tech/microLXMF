@@ -77,18 +77,24 @@ public:
     using FieldList = std::vector<std::pair<RNS::Bytes, RNS::Bytes>>;
 
     void announce();
+    // `timestamp` (Unix seconds) pins the LXMessage timestamp pre-pack
+    // for deterministic-hash tests; 0.0 means "use OS::time()" (the
+    // production path). See test_pinned_timestamp_produces_deterministic_message_hash.
     RNS::Bytes send_opportunistic(const RNS::Bytes& dest_hash,
                                   const std::string& content,
                                   const std::string& title,
-                                  const FieldList& fields = {});
+                                  const FieldList& fields = {},
+                                  double timestamp = 0.0);
     RNS::Bytes send_direct(const RNS::Bytes& dest_hash,
                            const std::string& content,
                            const std::string& title,
-                           const FieldList& fields = {});
+                           const FieldList& fields = {},
+                           double timestamp = 0.0);
     RNS::Bytes send_propagated(const RNS::Bytes& dest_hash,
                                const std::string& content,
                                const std::string& title,
-                               const FieldList& fields = {});
+                               const FieldList& fields = {},
+                               double timestamp = 0.0);
 
     // Phase-1 propagation helpers. The bridge harness configures an
     // outbound propagation node via these before sending PROPAGATED
@@ -124,6 +130,11 @@ public:
 
     // Outbound state map.
     std::string get_message_state(const RNS::Bytes& message_hash);
+
+    // Outbound progress map. Returns -1.0 if no progress has been
+    // recorded for the given message hash (e.g. the message used the
+    // PACKET path, which does not tick progress).
+    float get_message_progress(const RNS::Bytes& message_hash);
 
     // Identity hashes (LXMF semantics).
     RNS::Bytes identity_hash() const;
@@ -172,6 +183,7 @@ private:
     // Outbound state map: message_hash -> state.
     std::mutex _outbound_mutex;
     std::map<RNS::Bytes, LXMF::Type::Message::State> _outbound_states;
+    std::map<RNS::Bytes, float> _outbound_progress;
 
     // Top-level mutex around init/shutdown + interface registration.
     std::mutex _lifecycle_mutex;

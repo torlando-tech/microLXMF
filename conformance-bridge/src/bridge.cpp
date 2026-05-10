@@ -66,6 +66,13 @@ int int_param_or(const json& p, const char* key, int def) {
     return p[key].get<int>();
 }
 
+double double_param_or(const json& p, const char* key, double def) {
+    if (!p.contains(key) || p[key].is_null()) return def;
+    // JSON `1700000000` arrives as integer-typed; accept either.
+    if (p[key].is_number_integer()) return (double)p[key].get<int64_t>();
+    return p[key].get<double>();
+}
+
 std::string str_param(const json& p, const char* key) {
     if (!p.contains(key) || p[key].is_null()) {
         throw std::runtime_error(std::string("Missing param: ") + key);
