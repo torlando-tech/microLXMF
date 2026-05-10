@@ -4,7 +4,7 @@ JSON-RPC stdio bridge for [lxmf-conformance](https://github.com/torlando-tech/lx
 
 ## Status
 
-**28/28 conformance tests passing on the python ↔ microlxmf matrix in CI.** Propagation-via-`lxmd` (3 tests) is excluded pending the upstream Resource-RX gap — see [issue #1](https://github.com/torlando-tech/microLXMF/issues/1) and "Known gaps" below.
+**Full conformance suite passing on the python ↔ microlxmf matrix in CI**, including propagation-via-`lxmd`. Issue #1 (Resource transfer to lxmd doesn't conclude) was resolved transitively by the microReticulum progress-callback wiring fix in PR #2.
 
 | Test suite | Results | Status |
 |---|---|---|
@@ -15,7 +15,7 @@ JSON-RPC stdio bridge for [lxmf-conformance](https://github.com/torlando-tech/lx
 | `test_direct_large` | **4/4 pass** | Resource transfer end-to-end (single-segment), incl. sender `delivered` state |
 | `test_attachments` | **3/3 pass** | LXMF fields wire format (`dict[int, Any]`) round-trip |
 | `test_combined` | **3/3 pass** | Resource transfer + fields together |
-| `test_propagation` | excluded | Resource transfer to lxmd doesn't conclude — see #1 |
+| `test_propagation` | **4/4 pass** | PROPAGATED upload to lxmd + receiver sync (4 trios: sender × receiver) |
 
 ## Build
 
@@ -29,16 +29,15 @@ cmake --build build --target microLXMFBridge
 
 ```bash
 cd ~/repos/lxmf-conformance
-pytest tests/ --ignore=tests/test_propagation.py \
-    --impls=python,microlxmf -v
-# 28 passed
+pytest tests/ --impls=python,microlxmf -v
+# Full suite passes including propagation.
 ```
 
 Optional: `MICROLXMF_BRIDGE_LOGLEVEL=N` env var (0..8) controls bridge stderr verbosity (CRITICAL..TRACE). Default ERROR keeps pytest capture small.
 
 ## Bugs surfaced + fixed during conformance bring-up
 
-The conformance harness drove out 7 substantive bugs in microReticulum, microLXMF, and the bridge runtime. All listed below are fixed; the remaining unfixed gap is in "Known gaps" further down:
+The conformance harness drove out 7 substantive bugs in microReticulum, microLXMF, and the bridge runtime — all listed below are fixed:
 
 1. **Path table never initialized.** `Reticulum::transport_enabled` was off (pyxis's leaf-node default), and the gate ALSO blocks `Transport::start` from initializing `_path_store` (microStore-backed path table). Without it, every `_new_path_table.put` on inbound announces returned false silently — no destinations were ever learned. **This is identical to pyxis's runtime "announces don't show in UI" issue** — the conformance harness produced a deterministic reproducer.
 
@@ -54,9 +53,9 @@ The conformance harness drove out 7 substantive bugs in microReticulum, microLXM
 
 7. **Inbound message seq race.** `Runtime::on_delivery` advanced the seq counter under one mutex, then pushed the message under another. A concurrent `lxmf_get_received_messages(since_seq=N)` could observe `last_seq=N` but find `_inbound` empty, then skip seq=N on the next drain. Combined into a single locked block.
 
-## Known gaps (needs upstream work)
+## Known gaps
 
-A. **Propagation via `lxmd` (Resource transfer to a propagation node) doesn't conclude.** Direct Resource transfer (`test_direct_large`, `test_combined`) works end-to-end, but the sender → `lxmd` → receiver path stalls — `lxmd` does not log `propagation_resource_concluded`. Likely upstream microReticulum Resource state machine gap on the link-proof / resource-concluded handshake specific to the propagation upload. Tracked in [issue #1](https://github.com/torlando-tech/microLXMF/issues/1); CI excludes `tests/test_propagation.py` until this is resolved.
+None currently — propagation interop closed out by the microReticulum progress-callback fix (resolved issue #1).
 
 ## Architecture
 

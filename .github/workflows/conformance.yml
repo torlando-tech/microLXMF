@@ -124,12 +124,14 @@ jobs:
           CONFORMANCE_MICROLXMF_BRIDGE_CMD: >-
             ${{ github.workspace }}/microLXMF/conformance-bridge/build/microLXMFBridge
         # --impls python,microlxmf generates every (sender × receiver)
-        # combination across the two impls. Propagation tests are
-        # skipped via --ignore until lxmd Resource-transfer interop
-        # lands; see conformance-bridge/README.md.
+        # combination across the two impls. Full surface including
+        # propagation-via-lxmd (previously excluded under #1 — fixed
+        # transitively by the microReticulum Resource progress-callback
+        # fix in PR #2; the resource state machine completes its
+        # notification path now that `_callbacks._progress` actually
+        # fires during transfer).
         run: |
           python -m pytest tests/ \
-            --ignore=tests/test_propagation.py \
             -v --tb=short \
             --impls python,microlxmf
 
