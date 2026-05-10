@@ -170,6 +170,10 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
         std::lock_guard<std::mutex> g(_outbound_mutex);
         _outbound_states[m.hash()] = LXMF::Type::Message::FAILED;
     });
+    _router->register_progress_callback([this](LXMF::LXMessage& m) {
+        std::lock_guard<std::mutex> g(_outbound_mutex);
+        _outbound_progress[m.hash()] = m.progress();
+    });
 
     // Worker thread.
     _stopping.store(false);
@@ -396,6 +400,18 @@ std::string Runtime::get_message_state(const Bytes& message_hash) {
     auto it = _outbound_states.find(message_hash);
     if (it == _outbound_states.end()) return "unknown";
     return state_to_string(it->second);
+}
+
+float Runtime::get_message_progress(const Bytes& message_hash) {
+    std::lock_guard<std::mutex> g(_outbound_mutex);
+    auto it = _outbound_progress.find(message_hash);
+    if (it == _outbound_progress.end()) {
+        // No progress recorded — either we haven't sent this message,
+        // or it took the PACKET path (small payloads, no resource).
+        // Convention: -1.0 signals "no progress observed".
+        return -1.0f;
+    }
+    return it->second;
 }
 
 Bytes Runtime::identity_hash() const {

@@ -47,11 +47,13 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: torlando-tech/lxmf-conformance
-          # TODO: switch back to default (main) once
-          # `feat/register-microlxmf-impl` lands. Today main doesn't yet
-          # know about the microlxmf impl, so pytest collection errors
-          # with "Unknown impl in --impls: microlxmf".
-          ref: feat/register-microlxmf-impl
+          # TODO: switch back to default (main) once both stacked
+          # PRs land. `feat/test-resource-progress` is stacked on top
+          # of `feat/register-microlxmf-impl` and includes both the
+          # microlxmf impl registration AND the new
+          # test_resource_progress that exercises the progress callback
+          # added in this branch.
+          ref: feat/test-resource-progress
           path: lxmf-conformance
 
       - name: Checkout Reticulum (Python reference)

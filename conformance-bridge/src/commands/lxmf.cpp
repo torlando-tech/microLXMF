@@ -200,6 +200,16 @@ REGISTER_COMMAND(lxmf_get_message_state, {
     return bridge::json{{"state", rt.get_message_state(to_rns(hash))}};
 })
 
+// Returns the resource-transfer progress for the given message in
+// [0.0, 1.0], or -1.0 if no progress has been recorded for it (the
+// PACKET path doesn't tick progress; small messages go straight from
+// SENT to DELIVERED). Mirrors python LXMF's `LXMessage.progress`.
+REGISTER_COMMAND(lxmf_get_message_progress, {
+    auto& rt = bridge::Runtime::instance();
+    auto hash = bridge::hex_param(p, "message_hash");
+    return bridge::json{{"progress", rt.get_message_progress(to_rns(hash))}};
+})
+
 REGISTER_COMMAND(lxmf_shutdown, {
     (void)p;
     auto& rt = bridge::Runtime::instance();

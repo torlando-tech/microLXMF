@@ -125,6 +125,11 @@ public:
     // Outbound state map.
     std::string get_message_state(const RNS::Bytes& message_hash);
 
+    // Outbound progress map. Returns -1.0 if no progress has been
+    // recorded for the given message hash (e.g. the message used the
+    // PACKET path, which does not tick progress).
+    float get_message_progress(const RNS::Bytes& message_hash);
+
     // Identity hashes (LXMF semantics).
     RNS::Bytes identity_hash() const;
     RNS::Bytes delivery_destination_hash() const;
@@ -172,6 +177,7 @@ private:
     // Outbound state map: message_hash -> state.
     std::mutex _outbound_mutex;
     std::map<RNS::Bytes, LXMF::Type::Message::State> _outbound_states;
+    std::map<RNS::Bytes, float> _outbound_progress;
 
     // Top-level mutex around init/shutdown + interface registration.
     std::mutex _lifecycle_mutex;

@@ -259,6 +259,27 @@ static void static_resource_concluded_callback(const Resource& resource) {
 	WARNING("static_resource_concluded_callback: no registered router");
 }
 
+// Static callback for outbound resource progress (sending).
+// Called whenever the underlying RNS::Resource ticks its progress mid-flight.
+// Looks up the matching message hash, blends the resource's 0–1 progress
+// into the LXMF-level 0.10–1.0 band (mirroring python LXMF's
+// `_LXMessage__update_transfer_progress`), and dispatches to the public
+// LXMRouter::handle_resource_progress which has private-member access
+// to fire every registered router's _progress_callback.
+static void static_outbound_resource_progress(const Resource& resource) {
+	OutboundResourceSlot* slot = find_outbound_resource_slot(resource.hash());
+	if (!slot) {
+		// Resource not tracked — likely an LXMRouter we don't own.
+		return;
+	}
+	Bytes message_hash = slot->message_hash_bytes();
+	float resource_progress = resource.get_progress();
+	if (resource_progress < 0.0f) resource_progress = 0.0f;
+	if (resource_progress > 1.0f) resource_progress = 1.0f;
+	float lxmf_progress = 0.10f + 0.90f * resource_progress;
+	LXMRouter::handle_resource_progress(message_hash, lxmf_progress);
+}
+
 // Static callback for outbound resource concluded (sending)
 // Called when our resource transfer completes (receiver sent RESOURCE_PRF)
 static void static_outbound_resource_concluded(const Resource& resource) {
@@ -507,6 +528,11 @@ void LXMRouter::register_delivered_callback(DeliveredCallback callback) {
 void LXMRouter::register_failed_callback(FailedCallback callback) {
 	_failed_callback = callback;
 	DEBUG("Failed callback registered");
+}
+
+void LXMRouter::register_progress_callback(ProgressCallback callback) {
+	_progress_callback = callback;
+	DEBUG("Progress callback registered");
 }
 
 // Queue outbound message
@@ -1120,12 +1146,16 @@ bool LXMRouter::send_via_link(LXMessage& message, Link& link) {
 			return true;
 
 		} else if (message.representation() == Type::Message::RESOURCE) {
-			// Send as resource over link with concluded callback
+			// Send as resource over link with concluded + progress callbacks
 			snprintf(buf, sizeof(buf), "  Sending as resource (%zu bytes)", message.packed_size());
 			INFO(buf);
 
-			// Create resource with our callback to track completion
-			Resource resource(message.packed(), link, true, true, static_outbound_resource_concluded);
+			// Create resource with our concluded callback (fires on COMPLETE
+			// or FAILED) and progress callback (fires on each part transferred,
+			// blended into the message-level 0.10–1.0 progress band).
+			Resource resource(message.packed(), link, true, true,
+			                  static_outbound_resource_concluded,
+			                  static_outbound_resource_progress);
 
 			// Track this resource so we can match the callback to the message
 			if (resource.hash()) {
@@ -1224,6 +1254,31 @@ bool LXMRouter::send_opportunistic(LXMessage& message, const Identity& dest_iden
 }
 
 // Handle delivery proof for DIRECT messages
+void LXMRouter::handle_resource_progress(const Bytes& message_hash, float progress) {
+	// Match handle_direct_proof's dedup pattern — a single LXMRouter can
+	// appear in the registry under multiple slots (one per registered
+	// destination); fire its _progress_callback at most once per tick.
+	LXMRouter* notified_routers[ROUTER_REGISTRY_SIZE];
+	size_t notified_count = 0;
+
+	for (size_t i = 0; i < ROUTER_REGISTRY_SIZE; i++) {
+		if (!_router_registry_pool[i].in_use) continue;
+		LXMRouter* router = _router_registry_pool[i].router;
+		if (!router || !router->_progress_callback) continue;
+		bool already_notified = false;
+		for (size_t j = 0; j < notified_count; j++) {
+			if (notified_routers[j] == router) { already_notified = true; break; }
+		}
+		if (already_notified) continue;
+		notified_routers[notified_count++] = router;
+		Bytes empty_hash;
+		LXMessage msg(empty_hash, empty_hash);
+		msg.hash(message_hash);
+		msg.progress(progress);
+		router->_progress_callback(msg);
+	}
+}
+
 void LXMRouter::handle_direct_proof(const Bytes& message_hash) {
 	char buf[128];
 	snprintf(buf, sizeof(buf), "Processing DIRECT delivery proof for message %.16s...", message_hash.toHex().c_str());
