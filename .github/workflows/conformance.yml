@@ -47,6 +47,11 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: torlando-tech/lxmf-conformance
+          # TODO: drop after `test/simplify-resource-progress` lands.
+          # Branch removes the mid-flight progress assertion that
+          # diverges from python upstream's actual behavior (sender-
+          # side progress fires once per request batch, not per-part).
+          ref: test/simplify-resource-progress
           path: lxmf-conformance
 
       - name: Checkout Reticulum (Python reference)

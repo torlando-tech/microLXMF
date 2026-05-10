@@ -61,11 +61,12 @@ FetchContent_Declare(microreticulum
     # SHA bumps (CMake FetchContent caches branch refs across configure
     # runs in some setups, which made it tricky to verify the actual
     # commit being compiled). Bump this when landing a new microReticulum
-    # patch on the fork. Current pin = c3584b3 — sender progress callback
-    # fires per-part rather than per-batch, plus all the prior fixes
-    # (Identity ratchet, X25519 clamping, HMAC fix, PKCS7, Resource RX,
-    # link-proof callback, libbz2 vendor).
-    GIT_TAG c3584b3bbd9be8fb140b653e70b0c77fbe5cbcf8
+    # patch on the fork. Current pin = 3ee2bd8 — sender progress callback
+    # fires per-batch to match python upstream (Resource.py:1071), plus
+    # all the prior fixes (Identity ratchet, X25519 clamping, HMAC fix,
+    # PKCS7, Resource RX + per-part receiver progress, link-proof
+    # callback, libbz2 vendor).
+    GIT_TAG 3ee2bd8b66dc73127f5f76739a44aa84cc7b2c0e
 )
 FetchContent_MakeAvailable(microreticulum)
 
