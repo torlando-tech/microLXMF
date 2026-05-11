@@ -4,7 +4,7 @@ JSON-RPC stdio bridge for [lxmf-conformance](https://github.com/torlando-tech/lx
 
 ## Status
 
-**Full conformance suite passing on the python ↔ microlxmf matrix in CI**, including propagation-via-`lxmd`. Issue #1 (Resource transfer to lxmd doesn't conclude) was resolved transitively by the microReticulum progress-callback wiring fix in PR #2.
+**Full conformance suite passing on the python ↔ microlxmf matrix locally** (86/86 in ~7m). Issue #1 (Resource transfer to lxmd doesn't conclude) was resolved transitively by the microReticulum progress-callback wiring fix in PR #2 — all 4 propagation trios pass on a developer machine. Propagation is currently excluded in CI under a slow-runner timing flake (separate from #1); the `python->lxmd_pn->microlxmf` receive-sync variant hangs past pytest's 360s timeout on 2-core GitHub runners. Tracked separately.
 
 | Test suite | Results | Status |
 |---|---|---|
@@ -15,7 +15,7 @@ JSON-RPC stdio bridge for [lxmf-conformance](https://github.com/torlando-tech/lx
 | `test_direct_large` | **4/4 pass** | Resource transfer end-to-end (single-segment), incl. sender `delivered` state |
 | `test_attachments` | **3/3 pass** | LXMF fields wire format (`dict[int, Any]`) round-trip |
 | `test_combined` | **3/3 pass** | Resource transfer + fields together |
-| `test_propagation` | **4/4 pass** | PROPAGATED upload to lxmd + receiver sync (4 trios: sender × receiver) |
+| `test_propagation` | **4/4 pass locally**; CI-excluded | PROPAGATED upload to lxmd + receiver sync — CI flake on slow runners |
 
 ## Build
 
@@ -30,7 +30,8 @@ cmake --build build --target microLXMFBridge
 ```bash
 cd ~/repos/lxmf-conformance
 pytest tests/ --impls=python,microlxmf -v
-# Full suite passes including propagation.
+# Full suite passes locally (including propagation).
+# CI excludes test_propagation under a separate slow-runner flake.
 ```
 
 Optional: `MICROLXMF_BRIDGE_LOGLEVEL=N` env var (0..8) controls bridge stderr verbosity (CRITICAL..TRACE). Default ERROR keeps pytest capture small.
@@ -55,7 +56,7 @@ The conformance harness drove out 7 substantive bugs in microReticulum, microLXM
 
 ## Known gaps
 
-None currently — propagation interop closed out by the microReticulum progress-callback fix (resolved issue #1).
+- **CI flake on `python->lxmd_pn->microlxmf` propagation receive-sync.** Passes locally 4/4 (~30s/trio); on 2-core GitHub-hosted runners the bridge's receive-side sync hangs past pytest's 360s timeout. Suspected CPU-bound race in the worker loop's interaction with RNS Transport / Link callbacks under load. Investigated separately from issue #1 (which was about correctness — that's resolved). CI currently excludes `tests/test_propagation.py`.
 
 ## Architecture
 

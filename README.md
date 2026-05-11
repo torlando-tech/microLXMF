@@ -8,7 +8,7 @@ Targets ESP32 (Arduino framework) and host (POSIX) builds; the same source tree 
 
 ## Status
 
-Cross-impl conformance against the python LXMF reference passes the full surface — announce, opportunistic, direct (small + resource), attachments, combined, dedup, payload-format, resource progress, and propagation-via-`lxmd`. See [`conformance-bridge/README.md`](conformance-bridge/README.md) for the per-suite breakdown.
+Cross-impl conformance against the python LXMF reference passes the full surface — announce, opportunistic, direct (small + resource), attachments, combined, dedup, payload-format, resource progress, and propagation-via-`lxmd`. CI runs everything except propagation, which has a slow-runner timing flake (4/4 locally). See [`conformance-bridge/README.md`](conformance-bridge/README.md) for the per-suite breakdown.
 
 Sources were extracted from [pyxis](https://github.com/torlando-tech/pyxis)' vendored fork (originally derived from `torlando-tech/microReticulum:feat/t-deck`'s LXMF subtree) and aligned to vanilla `attermann/microReticulum @ 0.3.0`.
 
