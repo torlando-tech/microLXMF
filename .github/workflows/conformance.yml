@@ -124,9 +124,14 @@ jobs:
           CONFORMANCE_MICROLXMF_BRIDGE_CMD: >-
             ${{ github.workspace }}/microLXMF/conformance-bridge/build/microLXMFBridge
         # --impls python,microlxmf generates every (sender × receiver)
-        # combination across the two impls. Propagation tests are
-        # skipped via --ignore until lxmd Resource-transfer interop
-        # lands; see conformance-bridge/README.md.
+        # combination across the two impls. Propagation tests pass
+        # 4/4 locally but flake on slow CI runners — the
+        # `python->lxmd_pn->microlxmf` receive-sync variant hangs
+        # past pytest's 360s timeout under 2-core load. CPU-bound
+        # race in the bridge's worker loop suspected; tracked as a
+        # separate investigation. Issue #1 (Resource transfer to
+        # lxmd doesn't conclude) IS resolved — the test correctness
+        # path works; only the CI-environment timing flake remains.
         run: |
           python -m pytest tests/ \
             --ignore=tests/test_propagation.py \
