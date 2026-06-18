@@ -1,7 +1,7 @@
 #pragma once
 
 #include "LXMessage.h"
-#include <Bytes.h>
+#include <microReticulum/Bytes.h>
 
 #include <ArduinoJson.h>
 #include <microStore/FileSystem.h>

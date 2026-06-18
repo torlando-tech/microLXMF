@@ -1,9 +1,9 @@
 #include "LXMessage.h"
 #include "LXStamper.h"
-#include <Log.h>
-#include <Utilities/OS.h>
-#include <Packet.h>
-#include <Resource.h>
+#include <microReticulum/Log.h>
+#include <microReticulum/Utilities/OS.h>
+#include <microReticulum/Packet.h>
+#include <microReticulum/Resource.h>
 
 #include <MsgPack.h>
 #include <functional>

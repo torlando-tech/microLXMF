@@ -1,9 +1,9 @@
 #pragma once
 
 #include "Type.h"
-#include <Bytes.h>
-#include <Identity.h>
-#include <Transport.h>
+#include <microReticulum/Bytes.h>
+#include <microReticulum/Identity.h>
+#include <microReticulum/Transport.h>
 
 #include <vector>
 #include <functional>

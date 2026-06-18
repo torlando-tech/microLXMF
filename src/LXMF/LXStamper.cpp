@@ -1,11 +1,11 @@
 #include "LXStamper.h"
 #include "Type.h"
-#include <Identity.h>
-#include <Cryptography/HKDF.h>
-#include <Cryptography/Random.h>
+#include <microReticulum/Identity.h>
+#include <microReticulum/Cryptography/HKDF.h>
+#include <microReticulum/Cryptography/Random.h>
 #include <RNG.h>
-#include <Utilities/OS.h>
-#include <Log.h>
+#include <microReticulum/Utilities/OS.h>
+#include <microReticulum/Log.h>
 
 #include <SHA256.h>
 

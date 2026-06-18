@@ -1,9 +1,9 @@
 #include "LXMRouter.h"
-#include <Log.h>
-#include <Utilities/OS.h>
-#include <Packet.h>
-#include <Transport.h>
-#include <Resource.h>
+#include <microReticulum/Log.h>
+#include <microReticulum/Utilities/OS.h>
+#include <microReticulum/Packet.h>
+#include <microReticulum/Transport.h>
+#include <microReticulum/Resource.h>
 
 #include <MsgPack.h>
 
