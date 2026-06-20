@@ -629,30 +629,35 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 
 	std::string message_path = get_message_path(message_hash);
 
-	// Two-phase read: hot first, then archive (same pattern as load_message).
-	bool in_hot = Utilities::OS::file_exists(message_path.c_str());
-	bool in_archive = !in_hot && _archive_fs
-	                  && _archive_fs.exists(get_archive_message_path(message_hash).c_str());
-	if (!in_hot && !in_archive) {
-		return meta;
-	}
-
 	try {
+		// Read the hot file directly. read_file() returns 0 for a missing file
+		// (filesystem.size()==0, no error), so a separate file_exists() probe is
+		// unnecessary — that probe was a third LittleFS open per message (after
+		// size() + readFile()), and opens dominate conversation-load time. Fall
+		// back to the archive only when the hot read comes up empty.
 		Bytes data;
-		size_t n_read = 0;
-		if (in_hot) {
-			n_read = Utilities::OS::read_file(message_path.c_str(), data);
-		} else {
+		size_t n_read = Utilities::OS::read_file(message_path.c_str(), data);
+		if (n_read == 0 && _archive_fs) {
 			std::string arch_path = get_archive_message_path(message_hash);
-			n_read = read_archive_file(arch_path.c_str(), data);
+			if (_archive_fs.exists(arch_path.c_str())) {
+				n_read = read_archive_file(arch_path.c_str(), data);
+			}
 		}
 		if (n_read == 0) {
 			return meta;
 		}
 
-		// Use reusable document to reduce heap fragmentation
+		// Parse only the metadata fields, skipping the large "packed" hex blob
+		// (the full message payload) — filtering stops deserializeJson from
+		// walking the biggest value in the document.
+		JsonDocument filter;
+		filter["content"] = true;
+		filter["timestamp"] = true;
+		filter["incoming"] = true;
+		filter["state"] = true;
 		_json_doc.clear();
-		DeserializationError error = deserializeJson(_json_doc, data.data(), data.size());
+		DeserializationError error = deserializeJson(_json_doc, data.data(), data.size(),
+		                                             DeserializationOption::Filter(filter));
 
 		if (error) {
 			return meta;
