@@ -372,6 +372,7 @@ namespace LXMF {
 		 * Loads conversations.json into _conversations_pool.
 		 */
 		bool load_index();
+		bool load_index_file(const std::string& index_path);
 
 		/**
 		 * @brief Save conversation index to disk
@@ -389,7 +390,9 @@ namespace LXMF {
 		 * @return Full path to message JSON file
 		 */
 		std::string get_message_path(const RNS::Bytes& message_hash) const;
-		bool recover_message_payload(const std::string& message_path);
+		bool recover_message_payload(const std::string& message_path,
+		                             const RNS::Bytes& expected_hash);
+		bool recover_archived_message_payload(const RNS::Bytes& expected_hash);
 
 		/**
 		 * @brief Get filesystem path for conversation directory
@@ -453,6 +456,8 @@ namespace LXMF {
 		 *         is removed iff archive succeeded (or no archive_fs).
 		 */
 		bool archive_one_message(const RNS::Bytes& message_hash);
+		bool update_archived_message_state(const RNS::Bytes& message_hash,
+		                                   Type::Message::State state);
 
 		/**
 		 * @brief Build the archive-side path for a message hash.

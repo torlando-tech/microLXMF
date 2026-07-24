@@ -501,7 +501,12 @@ static void test_interrupted_index_commit_recovers_previous_index() {
     std::string index_path = hot_root + "/conv.json";
     std::string backup_path = hot_root + "/conv.bak";
     EXPECT_TRUE(::rename(index_path.c_str(), backup_path.c_str()) == 0,
-                "simulate power loss after index moved to backup");
+                "preserve valid index generation as backup");
+    const char malformed[] = "{";
+    int bad_fd = ::open(index_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    EXPECT_TRUE(bad_fd >= 0 && ::write(bad_fd, malformed, 1) == 1,
+                "simulate malformed live index after interrupted commit");
+    if (bad_fd >= 0) ::close(bad_fd);
 
     {
         MessageStore recovered("/lxmf");
@@ -514,6 +519,76 @@ static void test_interrupted_index_commit_recovers_previous_index() {
                 "committed index exists after recovery");
     EXPECT_TRUE(::access(backup_path.c_str(), F_OK) != 0,
                 "stale backup removed after recovery");
+
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
+static void test_duplicate_index_identities_fail_closed() {
+    std::cout << "\n=== test_duplicate_index_identities_fail_closed ===\n";
+    std::string hot_root = "/tmp/mstore_duplicate_index_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+    std::string index_path = hot_root + "/conv.json";
+    std::string peer(32, '1');
+    std::string json = "{\"conversations\":[{\"peer_hash\":\"" + peer +
+        "\",\"messages\":[],\"last_activity\":0,\"unread_count\":0},{\"peer_hash\":\"" +
+        peer + "\",\"messages\":[],\"last_activity\":0,\"unread_count\":0}]}";
+    int fd = ::open(index_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    EXPECT_TRUE(fd >= 0 && ::write(fd, json.data(), json.size()) == (ssize_t)json.size(),
+                "seed duplicate conversation identities");
+    if (fd >= 0) ::close(fd);
+
+    test_fs::PrefixedFS hot_fs(hot_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+    MessageStore store("/lxmf");
+    Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
+    Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xF3);
+    LXMessage message = make_test_message(dest_hash, src_hash,
+                                          1700000000.0, "duplicate-index", true);
+    EXPECT_TRUE(!store.save_message(message),
+                "duplicate conversation identities reject store initialization");
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
+static void test_corrupt_live_payload_recovers_valid_backup() {
+    std::cout << "\n=== test_corrupt_live_payload_recovers_valid_backup ===\n";
+    std::string hot_root = "/tmp/mstore_payload_recovery_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+    test_fs::PrefixedFS hot_fs(hot_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+
+    Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
+    Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xF2);
+    LXMessage message = make_test_message(dest_hash, src_hash,
+                                          1700000000.0, "recover-payload", true);
+    {
+        MessageStore store("/lxmf");
+        EXPECT_TRUE(store.save_message(message), "seed payload before interrupted commit");
+    }
+
+    std::string stem = hot_root + "/m/" + message.hash().toHex().substr(0, 12);
+    std::string live = stem + ".j";
+    std::string backup = stem + ".bak";
+    EXPECT_TRUE(::rename(live.c_str(), backup.c_str()) == 0,
+                "preserve valid payload generation as backup");
+    int fd = ::open(live.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    EXPECT_TRUE(fd >= 0 && ::write(fd, "{", 1) == 1,
+                "seed malformed live payload");
+    if (fd >= 0) ::close(fd);
+
+    {
+        MessageStore recovered("/lxmf");
+        LXMessage loaded = recovered.load_message(message.hash());
+        EXPECT_EQ(loaded.hash().toHex(), message.hash().toHex(),
+                  "validated payload backup restores over malformed live file");
+    }
+    EXPECT_TRUE(::access(live.c_str(), F_OK) == 0,
+                "recovered payload committed at live path");
+    EXPECT_TRUE(::access(backup.c_str(), F_OK) != 0,
+                "payload backup consumed only after validation");
 
     RNS::Utilities::OS::deregister_filesystem();
     rmrf(hot_root);
@@ -573,6 +648,26 @@ static void test_cull_to_hot_with_archive() {
     LXMessage loaded = store.load_message(oldest_hash);
     EXPECT_EQ(loaded.hash().toHex(), oldest_hash.toHex(),
               "load_message hits archive fallback for oldest");
+    EXPECT_TRUE(store.update_message_state(
+                    oldest_hash, LXMF::Type::Message::State::DELIVERED),
+                "delivery state update commits to archived payload");
+    LXMessage archived_updated = store.load_message(oldest_hash);
+    EXPECT_EQ((int)archived_updated.state(),
+              (int)LXMF::Type::Message::State::DELIVERED,
+              "archived delivery state is restored from durable payload");
+    std::string archived_stem = archive_root + "/lxmf-archive/m/" +
+        oldest_hash.toHex().substr(0, 12);
+    std::string archived_live = archived_stem + ".j";
+    std::string archived_backup = archived_stem + ".bak";
+    EXPECT_TRUE(::rename(archived_live.c_str(), archived_backup.c_str()) == 0,
+                "preserve archived payload backup generation");
+    int archived_fd = ::open(archived_live.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    EXPECT_TRUE(archived_fd >= 0 && ::write(archived_fd, "{", 1) == 1,
+                "seed malformed archived live payload");
+    if (archived_fd >= 0) ::close(archived_fd);
+    LXMessage archive_recovered = store.load_message(oldest_hash);
+    EXPECT_EQ(archive_recovered.hash().toHex(), oldest_hash.toHex(),
+              "archived payload recovers from validated backup");
 
     // Newest is in hot — also loadable.
     Bytes newest_hash = conv_messages.back();
@@ -683,6 +778,8 @@ int main() {
         test_malformed_index_fails_closed();
         test_short_filename_collision_is_rejected();
         test_interrupted_index_commit_recovers_previous_index();
+        test_duplicate_index_identities_fail_closed();
+        test_corrupt_live_payload_recovers_valid_backup();
         test_cull_without_archive_deletes();
         test_cull_to_hot_with_archive();
         test_hard_cap_eviction();
