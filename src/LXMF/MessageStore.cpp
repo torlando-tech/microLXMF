@@ -114,6 +114,23 @@ bool MessageStore::initialize_storage() {
 // Load conversation index from disk
 void MessageStore::load_index() {
 	std::string index_path = "/conv.json";  // Short path for SPIFFS
+	std::string temp_path = "/conv.tmp";
+	std::string backup_path = "/conv.bak";
+
+	// Recover an index transaction interrupted between the two renames. A
+	// committed index always wins; otherwise restore the previous one.
+	if (!Utilities::OS::file_exists(index_path.c_str()) &&
+	    Utilities::OS::file_exists(backup_path.c_str())) {
+		if (!Utilities::OS::rename_file(backup_path.c_str(), index_path.c_str())) {
+			ERROR("Failed to restore conversation index backup");
+		}
+	} else if (Utilities::OS::file_exists(index_path.c_str()) &&
+	           Utilities::OS::file_exists(backup_path.c_str())) {
+		Utilities::OS::remove_file(backup_path.c_str());
+	}
+	if (Utilities::OS::file_exists(temp_path.c_str())) {
+		Utilities::OS::remove_file(temp_path.c_str());
+	}
 
 	if (!Utilities::OS::file_exists(index_path.c_str())) {
 		DEBUG("No existing conversation index found");
@@ -206,6 +223,8 @@ void MessageStore::load_index() {
 // Save conversation index to disk
 bool MessageStore::save_index() {
 	std::string index_path = "/conv.json";  // Short path for SPIFFS
+	std::string temp_path = "/conv.tmp";
+	std::string backup_path = "/conv.bak";
 
 	try {
 		// Use reusable document to reduce heap fragmentation
@@ -249,9 +268,44 @@ bool MessageStore::save_index() {
 		serializeJsonPretty(_json_doc, json_str);
 		Bytes data((const uint8_t*)json_str.data(), json_str.size());
 
-		if (Utilities::OS::write_file(index_path.c_str(), data) != data.size()) {
-			ERROR("Failed to write index file: " + index_path);
+		// Never truncate the only committed index in place. Write and verify a
+		// temporary file, then replace the index with a recoverable two-rename
+		// transaction. load_index() restores /conv.bak after an interrupted boot.
+		if (Utilities::OS::write_file(temp_path.c_str(), data) != data.size()) {
+			ERROR("Failed to write temporary index file: " + temp_path);
+			Utilities::OS::remove_file(temp_path.c_str());
 			return false;
+		}
+
+		Bytes verify;
+		if (Utilities::OS::read_file(temp_path.c_str(), verify) != data.size() ||
+		    verify.size() != data.size() ||
+		    memcmp(verify.data(), data.data(), data.size()) != 0) {
+			ERROR("Failed to verify temporary conversation index");
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+
+		if (Utilities::OS::file_exists(backup_path.c_str())) {
+			Utilities::OS::remove_file(backup_path.c_str());
+		}
+		bool had_index = Utilities::OS::file_exists(index_path.c_str());
+		if (had_index &&
+		    !Utilities::OS::rename_file(index_path.c_str(), backup_path.c_str())) {
+			ERROR("Failed to preserve previous conversation index");
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		if (!Utilities::OS::rename_file(temp_path.c_str(), index_path.c_str())) {
+			ERROR("Failed to commit conversation index");
+			if (had_index) {
+				Utilities::OS::rename_file(backup_path.c_str(), index_path.c_str());
+			}
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		if (had_index) {
+			Utilities::OS::remove_file(backup_path.c_str());
 		}
 
 		DEBUG("Saved conversation index");
@@ -310,26 +364,42 @@ bool MessageStore::save_message(const LXMessage& message) {
 		Bytes peer_hash = message.incoming() ? message.source_hash() : message.destination_hash();
 
 		// Get or create conversation slot
-		ConversationSlot* slot = get_or_create_conversation(peer_hash);
+		ConversationSlot* slot = find_conversation(peer_hash);
+		bool created_conversation = (slot == nullptr);
+		if (!slot) {
+			slot = get_or_create_conversation(peer_hash);
+		}
 		if (!slot) {
 			ERROR("Conversation pool is full, cannot add message");
+			Utilities::OS::remove_file(message_path.c_str());
 			return false;
 		}
 
 		ConversationInfo& conv = slot->info;
+		ConversationInfo previous_info = conv;
 
 		// Add message to conversation (if not already present)
 		bool already_exists = conv.has_message(message.hash());
+		Bytes evicted_hash;
 
 		if (!already_exists) {
-			// Hard-cap: if the in-memory hash list is at MAX, evict
-			// the oldest entry (frees one slot AND its archived file
-			// on the SD card) so new messages aren't silently dropped.
+			// Hard-cap: remove the oldest hash from the candidate index, but
+			// defer deleting its payload until the new index commits. This
+			// keeps rollback possible when storage fails.
 			if (conv.message_count >= MAX_MESSAGES_PER_CONVERSATION) {
-				evict_oldest_message(conv);
+				evicted_hash = conv.message_hash_bytes(0);
+				if (!evicted_hash || !conv.remove_message_hash(evicted_hash)) {
+					ERROR("Unable to reserve conversation slot for new message");
+					Utilities::OS::remove_file(message_path.c_str());
+					conv = previous_info;
+					return false;
+				}
 			}
 			if (!conv.add_message_hash(message.hash())) {
-				WARNING("Message pool full for conversation: " + peer_hash.toHex());
+				ERROR("Message pool full for conversation: " + peer_hash.toHex());
+				Utilities::OS::remove_file(message_path.c_str());
+				conv = previous_info;
+				return false;
 			} else {
 				conv.last_activity = message.timestamp();
 				conv.set_last_message_hash(message.hash());
@@ -343,8 +413,38 @@ bool MessageStore::save_message(const LXMessage& message) {
 			}
 		}
 
-		// Save updated index
-		save_index();
+		// A message is durable only when both its payload and the conversation
+		// index are committed. Roll back the in-memory mutation and orphaned
+		// payload when the index transaction fails.
+		if (!save_index()) {
+			ERROR("Message payload written but conversation index commit failed");
+			if (!already_exists) {
+				Utilities::OS::remove_file(message_path.c_str());
+			}
+			if (created_conversation) {
+				slot->clear();
+			} else {
+				conv = previous_info;
+			}
+			return false;
+		}
+
+		// The replacement index is now durable. It is safe to remove the
+		// hard-cap payload that the committed index no longer references.
+		if (evicted_hash) {
+			std::string hot_path = get_message_path(evicted_hash);
+			if (Utilities::OS::file_exists(hot_path.c_str())) {
+				Utilities::OS::remove_file(hot_path.c_str());
+			}
+			if (_archive_fs) {
+				std::string archive_path = get_archive_message_path(evicted_hash);
+				if (_archive_fs.exists(archive_path.c_str())) {
+					_archive_fs.remove(archive_path.c_str());
+				}
+			}
+			INFO("Hard-cap evicted committed message "
+			     + evicted_hash.toHex().substr(0, 16) + "...");
+		}
 
 		// Cull this conversation down to HOT_MESSAGES_PER_CONVERSATION:
 		// older messages are MOVED to the archive filesystem if one
@@ -491,37 +591,6 @@ bool MessageStore::archive_one_message(const Bytes& message_hash) {
 		        + hot_path);
 	}
 	return true;
-}
-
-bool MessageStore::evict_oldest_message(ConversationInfo& conv) {
-	if (conv.message_count == 0) return false;
-
-	// Index 0 is the oldest message in the conversation. With cull
-	// running on every save, index 0 is normally already in archive
-	// (or evicted entirely if no archive_fs is set). Either way, we
-	// want it gone from BOTH tiers and from the in-memory list.
-	Bytes oldest = conv.message_hash_bytes(0);
-	if (oldest.size() == 0) return false;
-
-	// Hot — likely already gone, but check & remove for safety.
-	std::string hot_path = get_message_path(oldest);
-	if (Utilities::OS::file_exists(hot_path.c_str())) {
-		Utilities::OS::remove_file(hot_path.c_str());
-	}
-	// Archive — the actual storage location for old messages.
-	if (_archive_fs) {
-		std::string arch_path = get_archive_message_path(oldest);
-		if (_archive_fs.exists(arch_path.c_str())) {
-			_archive_fs.remove(arch_path.c_str());
-		}
-	}
-	// Drop from the in-memory hash list (shifts all indices down).
-	bool removed = conv.remove_message_hash(oldest);
-	if (removed) {
-		INFO("evict_oldest_message: hard-cap evicted "
-		     + oldest.toHex().substr(0, 16) + "...");
-	}
-	return removed;
 }
 
 void MessageStore::cull_conversation_to_hot(const Bytes& peer_hash) {

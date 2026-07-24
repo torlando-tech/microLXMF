@@ -89,6 +89,7 @@ public:
 class PrefixedFSImpl : public microStore::FileSystemImpl {
 private:
     std::string _prefix;
+    bool _fail_index_writes;
     std::string fp(const char* path) const { return _prefix + path; }
     void mkparents(const std::string& path) const {
         // Ensure parent directories exist so ::open(O_CREAT) succeeds.
@@ -99,13 +100,21 @@ private:
         }
     }
 public:
-    PrefixedFSImpl(const std::string& prefix) : _prefix(prefix) {
+    PrefixedFSImpl(const std::string& prefix, bool fail_index_writes = false)
+        : _prefix(prefix), _fail_index_writes(fail_index_writes) {
         ::mkdir(prefix.c_str(), 0755);
     }
-    bool init() override { return true; }
+    bool init(bool reformatOnFail = true) override {
+        (void)reformatOnFail;
+        return true;
+    }
     bool format() override { return false; }
     microStore::File open(const char* path, microStore::File::Mode mode,
                           const bool create = false) override {
+        if (_fail_index_writes && mode != microStore::File::ModeRead &&
+            std::string(path).find("/conv.") == 0) {
+            return {};
+        }
         std::string full = fp(path);
         int flags;
         switch (mode) {
@@ -160,8 +169,8 @@ public:
 
 class PrefixedFS : public microStore::FileSystem {
 public:
-    PrefixedFS(const std::string& prefix)
-        : microStore::FileSystem(new PrefixedFSImpl(prefix)) {}
+    PrefixedFS(const std::string& prefix, bool fail_index_writes = false)
+        : microStore::FileSystem(new PrefixedFSImpl(prefix, fail_index_writes)) {}
 };
 
 }  // namespace test_fs
@@ -284,6 +293,129 @@ static void rmrf(const std::string& path) {
 }
 
 // ---------- tests ----------
+
+static void test_messages_survive_store_reconstruction() {
+    std::cout << "\n=== test_messages_survive_store_reconstruction ===\n";
+
+    std::string hot_root = "/tmp/mstore_reboot_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+
+    test_fs::PrefixedFS hot_fs(hot_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+
+    Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
+    Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xEE);
+    Bytes outgoing_dest; for (int i = 0; i < 16; ++i) outgoing_dest.append((uint8_t)0xDD);
+    LXMessage incoming = make_test_message(dest_hash, src_hash,
+                                           1700000000.0, "incoming-survives", true);
+    LXMessage outgoing = make_test_message(outgoing_dest, dest_hash,
+                                           1700000001.0, "outgoing-survives", false);
+
+    {
+        MessageStore before_reboot("/lxmf");
+        EXPECT_TRUE(before_reboot.save_message(incoming),
+                    "incoming message and index commit before reboot");
+        EXPECT_TRUE(before_reboot.save_message(outgoing),
+                    "outgoing message and index commit before reboot");
+    }
+
+    {
+        MessageStore after_reboot("/lxmf");
+        auto conversations = after_reboot.get_conversations();
+        EXPECT_EQ((int)conversations.size(), 2,
+                  "incoming and outgoing conversations restored");
+        auto incoming_messages = after_reboot.get_messages_for_conversation(src_hash);
+        auto outgoing_messages = after_reboot.get_messages_for_conversation(outgoing_dest);
+        EXPECT_EQ((int)incoming_messages.size(), 1,
+                  "incoming message hash restored");
+        EXPECT_EQ((int)outgoing_messages.size(), 1,
+                  "outgoing message hash restored");
+        if (!incoming_messages.empty()) {
+            LXMessage loaded = after_reboot.load_message(incoming_messages.front());
+            EXPECT_EQ(loaded.hash().toHex(), incoming.hash().toHex(),
+                      "incoming payload restored after store reconstruction");
+        }
+        if (!outgoing_messages.empty()) {
+            LXMessage loaded = after_reboot.load_message(outgoing_messages.front());
+            EXPECT_EQ(loaded.hash().toHex(), outgoing.hash().toHex(),
+                      "outgoing payload restored after store reconstruction");
+        }
+    }
+
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
+static void test_index_write_failure_is_reported() {
+    std::cout << "\n=== test_index_write_failure_is_reported ===\n";
+
+    std::string hot_root = "/tmp/mstore_index_failure_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+
+    test_fs::PrefixedFS failing_fs(hot_root, true);
+    RNS::Utilities::OS::register_filesystem(failing_fs);
+
+    {
+        MessageStore store("/lxmf");
+        Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
+        Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xEF);
+        LXMessage message = make_test_message(dest_hash, src_hash,
+                                              1700000000.0, "must-not-lie", true);
+
+        EXPECT_TRUE(!store.save_message(message),
+                    "save_message fails when durable index commit fails");
+        EXPECT_EQ((int)store.get_conversations().size(), 0,
+                  "failed index commit rolls back in-memory conversation");
+        EXPECT_EQ(count_files_in_messages_dir(hot_root), 0,
+                  "failed index commit removes orphaned message payload");
+    }
+
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
+static void test_interrupted_index_commit_recovers_previous_index() {
+    std::cout << "\n=== test_interrupted_index_commit_recovers_previous_index ===\n";
+
+    std::string hot_root = "/tmp/mstore_index_recovery_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+
+    test_fs::PrefixedFS hot_fs(hot_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+
+    Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
+    Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xF0);
+    LXMessage message = make_test_message(dest_hash, src_hash,
+                                          1700000000.0, "recover-index", true);
+
+    {
+        MessageStore store("/lxmf");
+        EXPECT_TRUE(store.save_message(message), "seed index before interrupted commit");
+    }
+
+    std::string index_path = hot_root + "/conv.json";
+    std::string backup_path = hot_root + "/conv.bak";
+    EXPECT_TRUE(::rename(index_path.c_str(), backup_path.c_str()) == 0,
+                "simulate power loss after index moved to backup");
+
+    {
+        MessageStore recovered("/lxmf");
+        auto messages = recovered.get_messages_for_conversation(src_hash);
+        EXPECT_EQ((int)messages.size(), 1,
+                  "backup index restored during next initialization");
+    }
+
+    EXPECT_TRUE(::access(index_path.c_str(), F_OK) == 0,
+                "committed index exists after recovery");
+    EXPECT_TRUE(::access(backup_path.c_str(), F_OK) != 0,
+                "stale backup removed after recovery");
+
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
 
 static void test_cull_to_hot_with_archive() {
     std::cout << "\n=== test_cull_to_hot_with_archive ===\n";
@@ -443,6 +575,9 @@ int main() {
               << MAX_MESSAGES_PER_CONVERSATION << "\n";
 
     try {
+        test_messages_survive_store_reconstruction();
+        test_index_write_failure_is_reported();
+        test_interrupted_index_commit_recovers_previous_index();
         test_cull_without_archive_deletes();
         test_cull_to_hot_with_archive();
         test_hard_cap_eviction();

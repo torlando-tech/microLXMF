@@ -436,21 +436,6 @@ namespace LXMF {
 
 	private:
 		/**
-		 * @brief Evict the OLDEST message from a conversation, freeing
-		 *        storage in both hot (if present) and archive (if present)
-		 *        and removing it from the in-memory hash list.
-		 *
-		 * Called when add_message_hash hits MAX_MESSAGES_PER_CONVERSATION.
-		 * Without this, the hard cap would silently start dropping NEW
-		 * messages once a conversation was full — instead we drop the
-		 * oldest (which is presumably already archived and rarely touched)
-		 * and let new messages flow in.
-		 *
-		 * @return True if eviction freed a slot, false otherwise.
-		 */
-		bool evict_oldest_message(ConversationInfo& conv);
-
-		/**
 		 * @brief Cull-walk a conversation, archiving messages older than
 		 *        HOT_MESSAGES_PER_CONVERSATION.
 		 *
