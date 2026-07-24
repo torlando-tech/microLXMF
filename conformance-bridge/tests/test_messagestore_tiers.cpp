@@ -90,6 +90,7 @@ class PrefixedFSImpl : public microStore::FileSystemImpl {
 private:
     std::string _prefix;
     bool _fail_index_writes;
+    bool _fail_message_temp_writes;
     std::string fp(const char* path) const { return _prefix + path; }
     void mkparents(const std::string& path) const {
         // Ensure parent directories exist so ::open(O_CREAT) succeeds.
@@ -100,8 +101,10 @@ private:
         }
     }
 public:
-    PrefixedFSImpl(const std::string& prefix, bool fail_index_writes = false)
-        : _prefix(prefix), _fail_index_writes(fail_index_writes) {
+    PrefixedFSImpl(const std::string& prefix, bool fail_index_writes = false,
+                   bool fail_message_temp_writes = false)
+        : _prefix(prefix), _fail_index_writes(fail_index_writes),
+          _fail_message_temp_writes(fail_message_temp_writes) {
         ::mkdir(prefix.c_str(), 0755);
     }
     bool init(bool reformatOnFail = true) override {
@@ -113,6 +116,11 @@ public:
                           const bool create = false) override {
         if (_fail_index_writes && mode != microStore::File::ModeRead &&
             std::string(path).find("/conv.") == 0) {
+            return {};
+        }
+        if (_fail_message_temp_writes && mode != microStore::File::ModeRead &&
+            std::string(path).find("/m/") == 0 &&
+            std::string(path).rfind(".tmp") == std::string(path).size() - 4) {
             return {};
         }
         std::string full = fp(path);
@@ -169,8 +177,10 @@ public:
 
 class PrefixedFS : public microStore::FileSystem {
 public:
-    PrefixedFS(const std::string& prefix, bool fail_index_writes = false)
-        : microStore::FileSystem(new PrefixedFSImpl(prefix, fail_index_writes)) {}
+    PrefixedFS(const std::string& prefix, bool fail_index_writes = false,
+               bool fail_message_temp_writes = false)
+        : microStore::FileSystem(new PrefixedFSImpl(
+              prefix, fail_index_writes, fail_message_temp_writes)) {}
 };
 
 }  // namespace test_fs
@@ -318,6 +328,9 @@ static void test_messages_survive_store_reconstruction() {
                     "incoming message and index commit before reboot");
         EXPECT_TRUE(before_reboot.save_message(outgoing),
                     "outgoing message and index commit before reboot");
+        EXPECT_TRUE(before_reboot.update_message_state(
+                        outgoing.hash(), LXMF::Type::Message::State::DELIVERED),
+                    "outgoing delivery state commit before reboot");
     }
 
     {
@@ -340,6 +353,8 @@ static void test_messages_survive_store_reconstruction() {
             LXMessage loaded = after_reboot.load_message(outgoing_messages.front());
             EXPECT_EQ(loaded.hash().toHex(), outgoing.hash().toHex(),
                       "outgoing payload restored after store reconstruction");
+            EXPECT_EQ((int)loaded.state(), (int)LXMF::Type::Message::State::DELIVERED,
+                      "outgoing delivery state restored after store reconstruction");
         }
     }
 
@@ -372,6 +387,93 @@ static void test_index_write_failure_is_reported() {
                   "failed index commit removes orphaned message payload");
     }
 
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
+static void test_payload_write_failure_is_reported() {
+    std::cout << "\n=== test_payload_write_failure_is_reported ===\n";
+    std::string hot_root = "/tmp/mstore_payload_failure_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+    test_fs::PrefixedFS failing_fs(hot_root, false, true);
+    RNS::Utilities::OS::register_filesystem(failing_fs);
+    {
+        MessageStore store("/lxmf");
+        Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
+        Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xE1);
+        LXMessage message = make_test_message(dest_hash, src_hash,
+                                              1700000000.0, "payload-failure", true);
+        EXPECT_TRUE(!store.save_message(message),
+                    "save_message fails when temporary payload write fails");
+        EXPECT_EQ((int)store.get_conversations().size(), 0,
+                  "payload failure leaves no in-memory conversation");
+        EXPECT_EQ(count_files_in_messages_dir(hot_root), 0,
+                  "payload failure leaves no message files");
+    }
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
+static void test_malformed_index_fails_closed() {
+    std::cout << "\n=== test_malformed_index_fails_closed ===\n";
+    std::string hot_root = "/tmp/mstore_malformed_index_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+    std::string index_path = hot_root + "/conv.json";
+    int fd = ::open(index_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    const char malformed[] = "{";
+    EXPECT_TRUE(fd >= 0 && ::write(fd, malformed, 1) == 1,
+                "seed malformed existing index");
+    if (fd >= 0) ::close(fd);
+
+    test_fs::PrefixedFS hot_fs(hot_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+    {
+        MessageStore store("/lxmf");
+        Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
+        Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xE2);
+        LXMessage message = make_test_message(dest_hash, src_hash,
+                                              1700000000.0, "must-reject", true);
+        EXPECT_TRUE(!store.save_message(message),
+                    "malformed existing index rejects new writes");
+    }
+    struct stat st{};
+    EXPECT_TRUE(::stat(index_path.c_str(), &st) == 0 && st.st_size == 1,
+                "malformed index is preserved instead of replaced with empty history");
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
+static void test_short_filename_collision_is_rejected() {
+    std::cout << "\n=== test_short_filename_collision_is_rejected ===\n";
+    std::string hot_root = "/tmp/mstore_collision_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+    test_fs::PrefixedFS hot_fs(hot_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+    {
+        MessageStore store("/lxmf");
+        Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
+        Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xE3);
+        LXMessage message = make_test_message(dest_hash, src_hash,
+                                              1700000000.0, "collision", true);
+        std::string message_dir = hot_root + "/m";
+        ::mkdir(message_dir.c_str(), 0755);
+        std::string collision_path = message_dir + "/" +
+            message.hash().toHex().substr(0, 12) + ".j";
+        const char collision[] = "{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
+        int fd = ::open(collision_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        EXPECT_TRUE(fd >= 0 && ::write(fd, collision, sizeof(collision) - 1) ==
+                    (ssize_t)(sizeof(collision) - 1), "seed truncated-filename collision");
+        if (fd >= 0) ::close(fd);
+        EXPECT_TRUE(!store.save_message(message),
+                    "different full hash at truncated filename is rejected");
+        struct stat st{};
+        EXPECT_TRUE(::stat(collision_path.c_str(), &st) == 0 &&
+                    st.st_size == (off_t)(sizeof(collision) - 1),
+                    "collision payload is not overwritten");
+    }
     RNS::Utilities::OS::deregister_filesystem();
     rmrf(hot_root);
 }
@@ -577,6 +679,9 @@ int main() {
     try {
         test_messages_survive_store_reconstruction();
         test_index_write_failure_is_reported();
+        test_payload_write_failure_is_reported();
+        test_malformed_index_fails_closed();
+        test_short_filename_collision_is_rejected();
         test_interrupted_index_commit_recovers_previous_index();
         test_cull_without_archive_deletes();
         test_cull_to_hot_with_archive();

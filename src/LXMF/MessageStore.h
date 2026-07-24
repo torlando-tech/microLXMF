@@ -371,7 +371,7 @@ namespace LXMF {
 		 *
 		 * Loads conversations.json into _conversations_pool.
 		 */
-		void load_index();
+		bool load_index();
 
 		/**
 		 * @brief Save conversation index to disk
@@ -389,6 +389,7 @@ namespace LXMF {
 		 * @return Full path to message JSON file
 		 */
 		std::string get_message_path(const RNS::Bytes& message_hash) const;
+		bool recover_message_payload(const std::string& message_path);
 
 		/**
 		 * @brief Get filesystem path for conversation directory
