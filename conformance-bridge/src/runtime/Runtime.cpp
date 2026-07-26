@@ -422,6 +422,7 @@ std::vector<Runtime::ReceivedMsg> Runtime::get_received_messages(
         if (m.seq > since_seq) out.push_back(m);
     }
     last_seq_out = _inbound_seq_counter;
+
     return out;
 }
 
@@ -507,6 +508,7 @@ void Runtime::on_delivery(LXMF::LXMessage& msg) {
     std::lock_guard<std::mutex> g(_inbound_mutex);
     rm.seq = ++_inbound_seq_counter;
     _inbound.push_back(std::move(rm));
+
 }
 
 std::string Runtime::state_to_string(LXMF::Type::Message::State s) {

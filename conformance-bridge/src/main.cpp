@@ -12,6 +12,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 
 // microReticulum and microLXMF log to a callback. Redirect everything to
 // stderr so it doesn't pollute the bridge's stdout JSON-RPC stream.
@@ -21,8 +22,22 @@ static void log_to_stderr(const char* msg, RNS::LogLevel level) {
 }
 
 int main() {
-    std::ios::sync_with_stdio(false);
-    std::cout.setf(std::ios::unitbuf);
+    // Preserve the original stdout exclusively for JSONL responses, then
+    // redirect process stdout to stderr. Some embedded dependencies bypass
+    // the RNS log callback and call printf() directly (occasionally without
+    // a trailing newline); allowing those bytes onto the protocol stream can
+    // prefix and invalidate an otherwise-correct JSON response.
+    const int json_fd = ::dup(STDOUT_FILENO);
+    if (json_fd < 0 || ::dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
+        std::fprintf(stderr, "failed to isolate bridge JSON stream\n");
+        return 2;
+    }
+    FILE* json_out = ::fdopen(json_fd, "w");
+    if (!json_out) {
+        std::fprintf(stderr, "failed to open bridge JSON stream\n");
+        ::close(json_fd);
+        return 2;
+    }
 
     RNS::set_log_callback(log_to_stderr);
     // Default to ERROR-only on stderr. Bump via MICROLXMF_BRIDGE_LOGLEVEL
@@ -35,8 +50,8 @@ int main() {
         RNS::loglevel(lvl);
     }
 
-    std::cout << "READY\n";
-    std::cout.flush();
+    std::fprintf(json_out, "READY\n");
+    std::fflush(json_out);
 
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -78,8 +93,10 @@ int main() {
             };
         }
 
-        std::cout << response.dump() << "\n";
-        std::cout.flush();
+        const std::string encoded = response.dump();
+        std::fprintf(json_out, "%s\n", encoded.c_str());
+        std::fflush(json_out);
     }
+    std::fclose(json_out);
     return 0;
 }
