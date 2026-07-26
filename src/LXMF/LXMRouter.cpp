@@ -1177,7 +1177,7 @@ bool LXMRouter::send_via_link(LXMessage& message, Link& link) {
 			INFO(buf);
 
 			Packet packet(link, message.packed());
-			PacketReceipt receipt = packet.send();
+			PacketReceipt receipt = packet.receipt_send();
 
 			// Register proof callback so the sender's _delivered_callback
 			// fires once the receiver acknowledges. Without this hook the
@@ -1281,7 +1281,7 @@ bool LXMRouter::send_opportunistic(LXMessage& message, const Identity& dest_iden
 
 		// Create and send packet
 		Packet packet(destination, packet_data, RNS::Type::Packet::DATA);
-		PacketReceipt receipt = packet.send();
+		PacketReceipt receipt = packet.receipt_send();
 
 		// Register proof callback to track delivery confirmation
 		if (receipt) {
