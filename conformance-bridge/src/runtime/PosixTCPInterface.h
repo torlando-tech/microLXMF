@@ -17,9 +17,9 @@
 
 #pragma once
 
-#include <Interface.h>
-#include <Bytes.h>
-#include <Log.h>
+#include <microReticulum/Interface.h>
+#include <microReticulum/Bytes.h>
+#include <microReticulum/Log.h>
 
 #include <atomic>
 #include <mutex>
@@ -58,7 +58,7 @@ public:
     bool is_online() const { return _online.load(); }
 
     // RNS::InterfaceImpl override.
-    virtual void send_outgoing(const RNS::Bytes& data) override;
+    virtual bool send_outgoing(const RNS::Bytes& data) override;
 
     // Externally-callable lifecycle (RNS::InterfaceImpl::start/stop are
     // protected; we expose them publicly for the bridge runtime).

@@ -16,8 +16,8 @@
 
 #include <LXMF/MessageStore.h>
 #include <LXMF/LXMessage.h>
-#include <Bytes.h>
-#include <Utilities/OS.h>
+#include <microReticulum/Bytes.h>
+#include <microReticulum/Utilities/OS.h>
 
 #include <microStore/Adapters/PosixFileSystem.h>
 #include <microStore/File.h>

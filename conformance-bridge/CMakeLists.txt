@@ -8,14 +8,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(FetchContent)
 
 # ============================================================================
-# microReticulum: pinned to torlando-tech/microReticulum:pyxis-fixes-on-0.3.0
-# (vanilla 0.3.0 + 3 PR-ready Cryptography fixes — PKCS7 padding, HMAC double-
-# feed, X25519 RFC 7748 clamping). Without these the bridge's AES/Token
-# interop with the python LXMF reference fails.
+# microReticulum: pin the same 0.4.1-layout commit used by Pyxis firmware.
+# Keeping the native bridge on the firmware dependency makes x86 tests compile
+# the same namespaced headers and transport/resource implementation.
 #
 # microReticulum's own CMakeLists already FetchContents ArduinoJson, MsgPack,
 # attermann/Crypto and produces these targets we'll link against:
-#   - ReticulumStatic  (the entire microReticulum library)
+#   - microReticulum / ReticulumStatic (version-dependent library target)
 #   - CryptoLib        (attermann/Crypto compiled)
 #   - ArduinoJson      (header-only INTERFACE lib)
 #   - MsgPack          (header-only INTERFACE lib)
@@ -61,14 +60,31 @@ FetchContent_Declare(microreticulum
     # SHA bumps (CMake FetchContent caches branch refs across configure
     # runs in some setups, which made it tricky to verify the actual
     # commit being compiled). Bump this when landing a new microReticulum
-    # patch on the fork. Current pin = 3ee2bd8 — sender progress callback
-    # fires per-batch to match python upstream (Resource.py:1071), plus
-    # all the prior fixes (Identity ratchet, X25519 clamping, HMAC fix,
-    # PKCS7, Resource RX + per-part receiver progress, link-proof
-    # callback, libbz2 vendor).
-    GIT_TAG 3ee2bd8337801173ed107c8d1deb6865739d37ff
+    # patch on the fork. Current pin matches platformio.ini in Pyxis.
+    GIT_TAG 6054f6ba82367628a85cd07fcb668b95e947f046
 )
+set(RNS_USE_FS ON CACHE BOOL "Enable native persistence" FORCE)
+set(RNS_PERSIST_PATHS ON CACHE BOOL "Persist native path tables" FORCE)
 FetchContent_MakeAvailable(microreticulum)
+
+# The homelab build host does not require a system libbz2-dev package. Build
+# microReticulum's vendored library so native simulation stays self-contained.
+enable_language(C)
+if(NOT TARGET bz2)
+    file(GLOB BZ2_SOURCES ${microreticulum_SOURCE_DIR}/lib/libbz2/*.c)
+    add_library(bz2 STATIC ${BZ2_SOURCES})
+    target_include_directories(bz2 PUBLIC ${microreticulum_SOURCE_DIR}/lib/libbz2)
+    target_compile_definitions(bz2 PRIVATE BZ_NO_STDIO)
+endif()
+target_include_directories(microReticulum PUBLIC ${microreticulum_SOURCE_DIR}/lib/libbz2)
+
+if(TARGET microReticulum)
+    set(RETICULUM_TARGET microReticulum)
+elseif(TARGET ReticulumStatic)
+    set(RETICULUM_TARGET ReticulumStatic)
+else()
+    message(FATAL_ERROR "microReticulum did not expose a supported CMake target")
+endif()
 
 # ============================================================================
 # microStore — header-only, POSIX backend.
@@ -105,7 +121,7 @@ FetchContent_MakeAvailable(debuglog)
 # PRIVATE deps — they're a transitive build dep but not exported. Bytes.h
 # includes <ArduinoJson.h> as part of its public surface so consumers need
 # them too.
-target_include_directories(ReticulumStatic PUBLIC
+target_include_directories(${RETICULUM_TARGET} PUBLIC
     ${arxcontainer_SOURCE_DIR}
     ${arxtypetraits_SOURCE_DIR}
     ${debuglog_SOURCE_DIR}
@@ -187,36 +203,10 @@ else()
     message(WARNING "Unpacker.h not found at ${msgpack_SOURCE_DIR}/MsgPack/Unpacker.h")
 endif()
 
-# microReticulum's CMakeLists glob is `src/*.cpp` — it misses tlsf.c (the
-# pool allocator backing RNS::Utilities::Memory). Compile it separately
-# and link into ReticulumStatic so the unresolved tlsf_* symbols disappear.
-enable_language(C)
-add_library(TlsfLib STATIC ${microreticulum_SOURCE_DIR}/src/Utilities/tlsf.c)
-target_include_directories(TlsfLib PUBLIC ${microreticulum_SOURCE_DIR}/src/Utilities)
-target_link_libraries(ReticulumStatic PUBLIC TlsfLib)
-
-# bzip2 (libbz2) — vendored into microReticulum/lib/libbz2 alongside the
-# new Cryptography/BZ2 wrapper. Resource transfer uses bz2 to compress
-# payloads matching python LXMF's auto_compress path; without it the
-# receiver can't decode resources sent from python.
-file(GLOB BZ2_SOURCES ${microreticulum_SOURCE_DIR}/lib/libbz2/*.c)
-add_library(Bz2Lib STATIC ${BZ2_SOURCES})
-target_include_directories(Bz2Lib PUBLIC ${microreticulum_SOURCE_DIR}/lib/libbz2)
-target_compile_options(Bz2Lib PRIVATE -Wno-everything -DBZ_NO_STDIO)
-target_link_libraries(ReticulumStatic PUBLIC Bz2Lib)
-
-# Make microStore headers visible to microReticulum's translation units.
-target_include_directories(ReticulumStatic PUBLIC ${microstore_SOURCE_DIR}/include)
-# Same compile defines microReticulum sets PRIVATE — but we need them for
-# downstream targets too (microLXMF, the bridge) so they see the same
-# headers Bytes.h sees. Without re-declaring these the bridge will compile
-# Bytes.h with different gating and we'll get ODR / linker mismatches.
-target_compile_definitions(ReticulumStatic PUBLIC
-    NATIVE
-    RNS_USE_FS
-    RNS_PERSIST_PATHS
-    USTORE_USE_POSIXFS
-)
+# The current microReticulum target recursively compiles tlsf.c, links system
+# bzip2, exports native persistence definitions, and propagates microStore.
+# Keep the explicit include for compatibility with its public Bytes headers.
+target_include_directories(${RETICULUM_TARGET} PUBLIC ${microstore_SOURCE_DIR}/include)
 
 # ============================================================================
 # microLXMF static lib
@@ -236,9 +226,10 @@ target_include_directories(MicroLXMFLib PUBLIC ${MICROLXMF_SRC})
 # microReticulum's FetchContent. Linking PUBLIC propagates their include
 # dirs to consumers (microLXMF .cpp files include <ArduinoJson.h> in
 # MessageStore.cpp; LXMRouter.cpp + LXMessage.cpp include <MsgPack.h>).
-target_link_libraries(MicroLXMFLib PUBLIC ReticulumStatic ArduinoJson MsgPack)
+target_link_libraries(MicroLXMFLib PUBLIC ${RETICULUM_TARGET} ArduinoJson MsgPack)
 target_compile_options(MicroLXMFLib PRIVATE
     -fexceptions
+    -fstack-usage
     -Wno-everything
 )
 
@@ -285,4 +276,15 @@ target_compile_options(test_messagestore_tiers PRIVATE
 target_compile_definitions(test_messagestore_tiers PRIVATE
     MICROLXMF_NATIVE=1
     NATIVE=1
+)
+
+# Pyxis invokes save_message() from LVGL's 8 KiB task. Keep enough headroom
+# for UI, packing, filesystem and C++ frames; v153 regressed to >8 KiB here.
+add_custom_target(check_messagestore_stack
+    COMMAND ${CMAKE_COMMAND}
+        -DSTACK_ROOT=${CMAKE_BINARY_DIR}
+        -DMAX_SAVE_MESSAGE_STACK=2048
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckMessageStoreStack.cmake
+    DEPENDS MicroLXMFLib
+    COMMENT "Checking MessageStore::save_message stack budget"
 )

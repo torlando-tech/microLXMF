@@ -18,11 +18,11 @@
 
 #pragma once
 
-#include <Bytes.h>
-#include <Identity.h>
-#include <Reticulum.h>
-#include <Transport.h>
-#include <microStore/Adapters/PosixFileSystem.h>
+#include <microReticulum/Bytes.h>
+#include <microReticulum/Identity.h>
+#include <microReticulum/Reticulum.h>
+#include <microReticulum/Transport.h>
+#include <microStore/Adapters/UniversalFileSystem.h>
 
 #include "../../../src/LXMF/LXMRouter.h"
 

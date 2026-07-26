@@ -6,7 +6,7 @@
 
 #include "bridge.h"
 
-#include <Log.h>
+#include <microReticulum/Log.h>
 
 #include <cstdio>
 #include <iostream>

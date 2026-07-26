@@ -7,8 +7,8 @@
 #include "../runtime/Runtime.h"
 #include "../runtime/MsgPackUtil.h"
 
-#include <Bytes.h>
-#include <Identity.h>
+#include <microReticulum/Bytes.h>
+#include <microReticulum/Identity.h>
 
 #include <cstring>
 #include <stdexcept>

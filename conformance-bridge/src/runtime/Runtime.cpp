@@ -2,10 +2,10 @@
 #include "PosixTCPInterface.h"
 #include "MsgPackUtil.h"
 
-#include <Cryptography/Random.h>
-#include <Destination.h>
-#include <Log.h>
-#include <Utilities/OS.h>
+#include <microReticulum/Cryptography/Random.h>
+#include <microReticulum/Destination.h>
+#include <microReticulum/Log.h>
+#include <microReticulum/Utilities/OS.h>
 #include <RNG.h>
 
 #include <fstream>
@@ -68,7 +68,7 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
     }
 
     {
-        microStore::Adapters::PosixFileSystem stack_fs(".");
+        microStore::Adapters::UniversalFileSystem stack_fs(".");
         _fs = stack_fs;  // shared_ptr copy
     }
     Utilities::OS::register_filesystem(_fs);

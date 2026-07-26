@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include <Bytes.h>
+#include <microReticulum/Bytes.h>
 #include <stdint.h>
 
 namespace bridge {

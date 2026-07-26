@@ -1,8 +1,8 @@
 #include "PosixTCPInterface.h"
 #include "HDLC.h"
 
-#include <Type.h>
-#include <Transport.h>
+#include <microReticulum/Type.h>
+#include <microReticulum/Transport.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -190,12 +190,12 @@ void PosixTCPInterface::reader_loop() {
     _online = false;
 }
 
-void PosixTCPInterface::send_outgoing(const Bytes& data) {
-    if (!_online.load()) return;
+bool PosixTCPInterface::send_outgoing(const Bytes& data) {
+    if (!_online.load()) return false;
     Bytes framed = HDLC::frame(data);
     std::lock_guard<std::mutex> lock(_write_mutex);
     int fd = _data_socket;
-    if (fd < 0) return;
+    if (fd < 0) return false;
     size_t total = 0;
     const uint8_t* buf = framed.data();
     size_t len = framed.size();
@@ -205,11 +205,12 @@ void PosixTCPInterface::send_outgoing(const Bytes& data) {
             if (errno == EINTR) continue;
             ERROR("PosixTCPInterface: send error: " + std::string(std::strerror(errno)));
             _online = false;
-            return;
+            return false;
         }
         total += (size_t)n;
     }
     InterfaceImpl::handle_outgoing(data);
+    return true;
 }
 
 }  // namespace bridge
