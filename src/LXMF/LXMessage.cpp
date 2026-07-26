@@ -358,7 +358,19 @@ LXMessage LXMessage::unpack_from_bytes(const Bytes& lxmf_bytes, Type::Message::M
 		// `indices[curr_index]` is the byte offset of the first key.
 		const uint8_t* fields_p = packed_payload.data();
 		const uint8_t* fields_end = fields_p + packed_payload.size();
-		fields_p += unpacker.indices[unpacker.index()];
+		if (unpacker.index() < unpacker.indices.size()) {
+			const size_t fields_offset = unpacker.indices[unpacker.index()];
+			if (fields_offset > packed_payload.size()) {
+				throw std::runtime_error("LXMF fields offset exceeds packed payload");
+			}
+			fields_p += fields_offset;
+		} else if (map_size.size() == 0 && arr_size.size() <= 4) {
+			// An empty final fields map has no following token, so MsgPack's
+			// item cursor legitimately points one past its indices table.
+			fields_p = fields_end;
+		} else {
+			throw std::runtime_error("LXMF fields map has no valid payload offset");
+		}
 
 		// Recursive skip — std::function captures itself for
 		// arbitrarily-nested array/map.
