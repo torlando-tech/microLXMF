@@ -87,7 +87,7 @@ The conformance harness drove out 7 substantive bugs in microReticulum, microLXM
 |---|---|---|
 | JSON-RPC dispatch | `src/main.cpp`, `src/bridge.{h,cpp}` | Same shape as reticulum-conformance microreticulum bridge |
 | Command handlers | `src/commands/lxmf.cpp` | 14 commands incl. `ping`, `lxmf_init`, `lxmf_send_*`, `lxmf_request_path`, `lxmf_has_path`, `lxmf_set_outbound_propagation_node` |
-| Runtime state | `src/runtime/Runtime.{h,cpp}` | Singleton owning Reticulum + LXMRouter + worker thread |
+| Runtime state | `src/runtime/Runtime.{h,cpp}` | Singleton owning Reticulum, MessageStore, LXMRouter and worker thread; outbound commands persist before routing |
 | TCP transport | `src/runtime/PosixTCPInterface.{h,cpp}` + `HDLC.h` | Single-peer (accept-one) server + client modes |
 | microLXMF | `../src/LXMF/` | Linked as static lib `MicroLXMFLib` |
 | microReticulum | Firmware-matched commit via FetchContent | Same 0.4.1 header and transport layout as Pyxis |

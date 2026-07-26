@@ -22,9 +22,10 @@
 #include <microReticulum/Identity.h>
 #include <microReticulum/Reticulum.h>
 #include <microReticulum/Transport.h>
-#include <microStore/Adapters/UniversalFileSystem.h>
+#include "PrefixedFileSystem.h"
 
 #include "../../../src/LXMF/LXMRouter.h"
+#include "../../../src/LXMF/MessageStore.h"
 
 #include <atomic>
 #include <cstdint>
@@ -153,9 +154,9 @@ private:
     std::atomic<bool> _initialized{false};
     std::atomic<bool> _stopping{false};
 
-    // microStore::FileSystem wraps shared_ptr<FileSystemImpl> internally,
-    // so passing-by-value retains lifetime. PosixFileSystem disables
-    // operator new — we construct on the stack and copy into _fs.
+    // microStore::FileSystem wraps shared_ptr<FileSystemImpl> internally.
+    // The host adapter prefixes embedded absolute paths such as /m and
+    // /conv.json into each bridge process's private temporary directory.
     microStore::FileSystem _fs;
 
     // RNS pieces.
@@ -167,6 +168,8 @@ private:
     // LXMF router. shared_ptr because LXMRouter::Ptr exists for
     // co-ownership patterns.
     std::shared_ptr<LXMF::LXMRouter> _router;
+    std::unique_ptr<LXMF::MessageStore> _message_store;
+    std::mutex _message_store_mutex;
 
     // Interfaces — keep them alive.
     std::vector<std::shared_ptr<PosixTCPInterface>> _interfaces;

@@ -68,7 +68,7 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
     }
 
     {
-        microStore::Adapters::UniversalFileSystem stack_fs(".");
+        PrefixedFileSystem stack_fs(_storage_path);
         _fs = stack_fs;  // shared_ptr copy
     }
     Utilities::OS::register_filesystem(_fs);
@@ -153,6 +153,7 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
     // LXMRouter.
     _router = std::make_shared<LXMF::LXMRouter>(_identity, _storage_path,
                                                 /*announce_at_start=*/false);
+    _message_store.reset(new LXMF::MessageStore(_storage_path + "/messages"));
     _router->set_display_name(_display_name);
     _router->register_delivery_callback(
         [this](LXMF::LXMessage& m) { this->on_delivery(m); });
@@ -161,14 +162,20 @@ void Runtime::init(const std::string& storage_path, const std::string& display_n
     _router->register_sent_callback([this](LXMF::LXMessage& m) {
         std::lock_guard<std::mutex> g(_outbound_mutex);
         _outbound_states[m.hash()] = LXMF::Type::Message::SENT;
+        std::lock_guard<std::mutex> store_guard(_message_store_mutex);
+        if (_message_store) _message_store->update_message_state(m.hash(), LXMF::Type::Message::SENT);
     });
     _router->register_delivered_callback([this](LXMF::LXMessage& m) {
         std::lock_guard<std::mutex> g(_outbound_mutex);
         _outbound_states[m.hash()] = LXMF::Type::Message::DELIVERED;
+        std::lock_guard<std::mutex> store_guard(_message_store_mutex);
+        if (_message_store) _message_store->update_message_state(m.hash(), LXMF::Type::Message::DELIVERED);
     });
     _router->register_failed_callback([this](LXMF::LXMessage& m) {
         std::lock_guard<std::mutex> g(_outbound_mutex);
         _outbound_states[m.hash()] = LXMF::Type::Message::FAILED;
+        std::lock_guard<std::mutex> store_guard(_message_store_mutex);
+        if (_message_store) _message_store->update_message_state(m.hash(), LXMF::Type::Message::FAILED);
     });
     _router->register_progress_callback([this](LXMF::LXMessage& m) {
         std::lock_guard<std::mutex> g(_outbound_mutex);
@@ -195,6 +202,7 @@ void Runtime::shutdown() {
     _iface_handles.clear();
     _interfaces.clear();
     _router.reset();
+    _message_store.reset();
     _reticulum.reset();
     _fs.clear();
 }
@@ -272,6 +280,8 @@ static Bytes send_message_internal(
     const std::string& title,
     const Runtime::FieldList& fields,
     LXMF::Type::Message::Method method,
+    LXMF::MessageStore& message_store,
+    std::mutex& message_store_mutex,
     std::mutex& outbound_mutex,
     std::map<Bytes, LXMF::Type::Message::State>& outbound_states,
     double timestamp = 0.0)
@@ -307,6 +317,12 @@ static Bytes send_message_internal(
     m.pack();
     Bytes hash = m.hash();
     {
+        std::lock_guard<std::mutex> g(message_store_mutex);
+        if (!message_store.save_message(m)) {
+            throw std::runtime_error("durable outbound message persistence failed");
+        }
+    }
+    {
         std::lock_guard<std::mutex> g(outbound_mutex);
         outbound_states[hash] = LXMF::Type::Message::OUTBOUND;
     }
@@ -322,6 +338,7 @@ Bytes Runtime::send_opportunistic(const Bytes& dest_hash,
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
     return send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::OPPORTUNISTIC,
+                                 *_message_store, _message_store_mutex,
                                  _outbound_mutex, _outbound_states, timestamp);
 }
 
@@ -333,6 +350,7 @@ Bytes Runtime::send_direct(const Bytes& dest_hash,
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
     return send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::DIRECT,
+                                 *_message_store, _message_store_mutex,
                                  _outbound_mutex, _outbound_states, timestamp);
 }
 
@@ -344,6 +362,7 @@ Bytes Runtime::send_propagated(const Bytes& dest_hash,
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
     return send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::PROPAGATED,
+                                 *_message_store, _message_store_mutex,
                                  _outbound_mutex, _outbound_states, timestamp);
 }
 
