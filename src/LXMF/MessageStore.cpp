@@ -394,7 +394,6 @@ bool MessageStore::save_message(const LXMessage& message) {
 	bool payload_committed = false;
 	bool index_committed = false;
 	ConversationSlot* transaction_slot = nullptr;
-	ConversationInfo previous_info;
 	bool conversation_snapshot = false;
 	bool created_conversation = false;
 	auto rollback_payload = [&]() {
@@ -532,7 +531,7 @@ bool MessageStore::save_message(const LXMessage& message) {
 		}
 
 		ConversationInfo& conv = transaction_slot->info;
-		previous_info = conv;
+		_transaction_snapshot = conv;
 		conversation_snapshot = true;
 
 		// Add message to conversation (if not already present)
@@ -548,14 +547,14 @@ bool MessageStore::save_message(const LXMessage& message) {
 				if (!evicted_hash || !conv.remove_message_hash(evicted_hash)) {
 					ERROR("Unable to reserve conversation slot for new message");
 					rollback_payload();
-					conv = previous_info;
+					conv = _transaction_snapshot;
 					return false;
 				}
 			}
 			if (!conv.add_message_hash(message.hash())) {
 				ERROR("Message pool full for conversation: " + peer_hash.toHex());
 				rollback_payload();
-				conv = previous_info;
+				conv = _transaction_snapshot;
 				return false;
 			} else {
 				conv.last_activity = message.timestamp();
@@ -579,7 +578,7 @@ bool MessageStore::save_message(const LXMessage& message) {
 			if (created_conversation) {
 				transaction_slot->clear();
 			} else {
-				conv = previous_info;
+				conv = _transaction_snapshot;
 			}
 			return false;
 		}
@@ -625,7 +624,7 @@ bool MessageStore::save_message(const LXMessage& message) {
 		rollback_payload();
 		if (conversation_snapshot && transaction_slot) {
 			if (created_conversation) transaction_slot->clear();
-			else transaction_slot->info = previous_info;
+			else transaction_slot->info = _transaction_snapshot;
 		}
 		ERROR("Exception saving message: " + std::string(e.what()));
 		return false;

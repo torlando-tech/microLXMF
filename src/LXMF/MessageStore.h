@@ -494,6 +494,13 @@ namespace LXMF {
 		// Note: This class is assumed to be used from a single thread (main loop).
 		// If called from multiple threads, this would need per-thread documents or locking.
 		JsonDocument _json_doc;
+
+		// Reusable rollback snapshot for save_message(). ConversationInfo is
+		// larger than 8 KiB, so placing it in the save_message stack frame
+		// overflows callers such as Pyxis's LVGL task. MessageStore already has
+		// a single-threaded contract because _json_doc is shared, so reuse one
+		// object-owned snapshot instead of allocating or copying it on the stack.
+		ConversationInfo _transaction_snapshot;
 	};
 
 }  // namespace LXMF
