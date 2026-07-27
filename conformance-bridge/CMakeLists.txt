@@ -288,3 +288,19 @@ add_custom_target(check_messagestore_stack
     DEPENDS MicroLXMFLib
     COMMENT "Checking MessageStore::save_message stack budget"
 )
+
+# Host-side regression coverage for lxmf.delivery announced stamp costs:
+# MessagePack parsing, nil clearing, malformed-data rejection, and bounded
+# cache eviction. The live cross-implementation suite separately proves that
+# the learned cost results in a stamped DIRECT message accepted by Python LXMF.
+add_executable(test_announced_stamp_cost tests/test_announced_stamp_cost.cpp)
+target_include_directories(test_announced_stamp_cost PRIVATE src)
+target_link_libraries(test_announced_stamp_cost PRIVATE MicroLXMFLib Threads::Threads)
+target_compile_options(test_announced_stamp_cost PRIVATE
+    -fexceptions
+    -Wall -Wno-unused-parameter -Wno-missing-field-initializers
+)
+target_compile_definitions(test_announced_stamp_cost PRIVATE
+    MICROLXMF_NATIVE=1
+    NATIVE=1
+)
