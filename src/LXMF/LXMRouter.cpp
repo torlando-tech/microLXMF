@@ -742,7 +742,7 @@ void LXMRouter::handle_outbound(LXMessage& message) {
 	// already requested a stamp explicitly. Generate before queueing so a
 	// required-stamp failure cannot be reported as a successful send.
 	bool generate_auto_stamp = false;
-	if (message.stamp_cost() == 0) {
+	if (message.method() != Type::Message::PROPAGATED && message.stamp_cost() == 0) {
 		const uint8_t announced_cost = get_outbound_stamp_cost(message.destination_hash());
 		if (announced_cost > MAX_AUTO_OUTBOUND_STAMP_COST) {
 			throw std::runtime_error("Peer-advertised stamp cost exceeds local automatic generation limit");
@@ -793,7 +793,10 @@ void LXMRouter::update_stamp_cost(const Bytes& destination_hash, uint8_t cost) {
 		auto& slot = _outbound_stamp_costs[i];
 		if (!slot.in_use || !slot.destination_hash_equals(destination_hash)) continue;
 		if (cost == 0) slot.clear();
-		else slot.cost = cost;
+		else {
+			slot.cost = cost;
+			slot.sequence = ++_outbound_stamp_costs_sequence;
+		}
 		return;
 	}
 
@@ -802,13 +805,15 @@ void LXMRouter::update_stamp_cost(const Bytes& destination_hash, uint8_t cost) {
 	// Reuse holes left by nil announces before evicting a live peer.
 	for (size_t i = 0; i < OUTBOUND_STAMP_COSTS_SIZE; ++i) {
 		if (_outbound_stamp_costs[i].in_use) continue;
-		_outbound_stamp_costs[i].set(destination_hash, cost);
+		_outbound_stamp_costs[i].set(destination_hash, cost, ++_outbound_stamp_costs_sequence);
 		return;
 	}
 
-	auto& slot = _outbound_stamp_costs[_outbound_stamp_costs_next];
-	slot.set(destination_hash, cost);
-	_outbound_stamp_costs_next = (_outbound_stamp_costs_next + 1) % OUTBOUND_STAMP_COSTS_SIZE;
+	size_t oldest = 0;
+	for (size_t i = 1; i < OUTBOUND_STAMP_COSTS_SIZE; ++i) {
+		if (_outbound_stamp_costs[i].sequence < _outbound_stamp_costs[oldest].sequence) oldest = i;
+	}
+	_outbound_stamp_costs[oldest].set(destination_hash, cost, ++_outbound_stamp_costs_sequence);
 }
 
 uint8_t LXMRouter::get_outbound_stamp_cost(const Bytes& destination_hash) const {

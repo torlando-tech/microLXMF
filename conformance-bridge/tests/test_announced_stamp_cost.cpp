@@ -117,6 +117,12 @@ void test_cache_reuses_cleared_slot_before_eviction() {
     assert(router.get_outbound_stamp_cost(destination_hash(0)) == 0);
     assert(router.get_outbound_stamp_cost(destination_hash(1)) == 2);
     assert(router.get_outbound_stamp_cost(destination_hash(90)) == 7);
+
+    for (uint8_t i = 92; i <= 100; ++i) {
+        router.update_stamp_cost(destination_hash(i), 9);
+    }
+    assert(router.get_outbound_stamp_cost(destination_hash(10)) == 0);
+    assert(router.get_outbound_stamp_cost(destination_hash(90)) == 7);
 }
 
 void test_outbound_message_uses_cached_cost_and_contains_valid_stamp() {
@@ -170,6 +176,33 @@ void test_excessive_announced_cost_fails_without_mining_or_queueing() {
     assert(router.pending_outbound_count() == 0);
 }
 
+void test_direct_cost_is_not_applied_to_propagated_delivery() {
+    Identity local_identity;
+    Identity remote_identity;
+    LXMRouter router(local_identity, "", false);
+    Destination remote(
+        remote_identity,
+        RNS::Type::Destination::OUT,
+        RNS::Type::Destination::SINGLE,
+        "lxmf",
+        "delivery"
+    );
+    router.update_stamp_cost(remote.hash(), 254);
+
+    LXMessage message(
+        remote,
+        router.delivery_destination(),
+        Bytes("propagated"),
+        {},
+        LXMF::Type::Message::PROPAGATED
+    );
+    router.handle_outbound(message);
+
+    assert(message.stamp_cost() == 0);
+    assert(!message.has_valid_stamp());
+    assert(router.pending_outbound_count() == 1);
+}
+
 } // namespace
 
 int main() {
@@ -180,6 +213,7 @@ int main() {
     test_cache_reuses_cleared_slot_before_eviction();
     test_outbound_message_uses_cached_cost_and_contains_valid_stamp();
     test_excessive_announced_cost_fails_without_mining_or_queueing();
+    test_direct_cost_is_not_applied_to_propagated_delivery();
     std::cout << "announced stamp cost tests passed\n";
     return 0;
 }

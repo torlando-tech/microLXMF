@@ -692,24 +692,27 @@ namespace LXMF {
 			bool in_use = false;
 			uint8_t destination_hash[DEST_HASH_SIZE] = {};
 			uint8_t cost = 0;
+			uint32_t sequence = 0;
 
 			bool destination_hash_equals(const RNS::Bytes& hash) const {
 				return hash.size() == DEST_HASH_SIZE &&
 				       memcmp(destination_hash, hash.data(), DEST_HASH_SIZE) == 0;
 			}
-			void set(const RNS::Bytes& hash, uint8_t new_cost) {
+			void set(const RNS::Bytes& hash, uint8_t new_cost, uint32_t new_sequence) {
 				memcpy(destination_hash, hash.data(), DEST_HASH_SIZE);
 				cost = new_cost;
+				sequence = new_sequence;
 				in_use = true;
 			}
 			void clear() {
 				in_use = false;
-				memset(destination_hash, 0, DEST_HASH_SIZE);
+				memset(destination_hash, 0, sizeof(destination_hash));
 				cost = 0;
+				sequence = 0;
 			}
 		};
 		OutboundStampCostSlot _outbound_stamp_costs[OUTBOUND_STAMP_COSTS_SIZE];
-		size_t _outbound_stamp_costs_next = 0;
+		uint32_t _outbound_stamp_costs_sequence = 0;
 
 		// Internal state
 		bool _initialized = false;
