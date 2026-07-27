@@ -391,6 +391,59 @@ static void test_index_write_failure_is_reported() {
     rmrf(hot_root);
 }
 
+static void test_delete_operations_fail_closed_on_index_failure() {
+    std::cout << "\n=== test_delete_operations_fail_closed_on_index_failure ===\n";
+
+    Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
+    Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xE0);
+
+    auto exercise = [&](const std::string& hot_root, int operation) {
+        rmrf(hot_root);
+        mkdir(hot_root.c_str(), 0755);
+        test_fs::PrefixedFS normal_fs(hot_root);
+        test_fs::PrefixedFS failing_fs(hot_root, true);
+        RNS::Utilities::OS::register_filesystem(normal_fs);
+
+        LXMessage message = make_test_message(
+            dest_hash, src_hash, 1700000000.0 + operation,
+            "delete-must-not-lie-" + std::to_string(operation), true);
+        {
+            MessageStore store("/lxmf");
+            EXPECT_TRUE(store.save_message(message), "seed message before failed delete");
+
+            RNS::Utilities::OS::deregister_filesystem();
+            RNS::Utilities::OS::register_filesystem(failing_fs);
+            bool result = operation == 0 ? store.delete_message(message.hash())
+                        : operation == 1 ? store.delete_conversation(src_hash)
+                                         : store.clear_all();
+            EXPECT_TRUE(!result, "destructive operation reports failed index commit");
+            EXPECT_EQ((int)store.get_messages_for_conversation(src_hash).size(), 1,
+                      "failed destructive commit restores in-memory index");
+            EXPECT_EQ(count_files_in_messages_dir(hot_root), 1,
+                      "failed destructive commit preserves payload");
+
+            RNS::Utilities::OS::deregister_filesystem();
+            RNS::Utilities::OS::register_filesystem(normal_fs);
+        }
+
+        {
+            MessageStore recovered("/lxmf");
+            EXPECT_EQ((int)recovered.get_messages_for_conversation(src_hash).size(), 1,
+                      "failed destructive commit preserves reboot index");
+            LXMessage loaded = recovered.load_message(message.hash());
+            EXPECT_EQ(loaded.hash().toHex(), message.hash().toHex(),
+                      "failed destructive commit preserves reboot payload");
+        }
+
+        RNS::Utilities::OS::deregister_filesystem();
+        rmrf(hot_root);
+    };
+
+    exercise("/tmp/mstore_delete_message_failure_test", 0);
+    exercise("/tmp/mstore_delete_conversation_failure_test", 1);
+    exercise("/tmp/mstore_clear_all_failure_test", 2);
+}
+
 static void test_payload_write_failure_is_reported() {
     std::cout << "\n=== test_payload_write_failure_is_reported ===\n";
     std::string hot_root = "/tmp/mstore_payload_failure_test";
@@ -774,6 +827,7 @@ int main() {
     try {
         test_messages_survive_store_reconstruction();
         test_index_write_failure_is_reported();
+        test_delete_operations_fail_closed_on_index_failure();
         test_payload_write_failure_is_reported();
         test_malformed_index_fails_closed();
         test_short_filename_collision_is_rejected();

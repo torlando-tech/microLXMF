@@ -381,7 +381,7 @@ namespace LXMF {
 		 *
 		 * @return True if saved successfully
 		 */
-		bool save_index();
+		bool save_index(bool empty = false);
 
 		/**
 		 * @brief Get filesystem path for a message file

@@ -274,7 +274,7 @@ bool MessageStore::load_index_file(const std::string& index_path) {
 }
 
 // Save conversation index to disk
-bool MessageStore::save_index() {
+bool MessageStore::save_index(bool empty) {
 	std::string index_path = "/conv.json";  // Short path for SPIFFS
 	std::string temp_path = "/conv.tmp";
 	std::string backup_path = "/conv.bak";
@@ -286,6 +286,7 @@ bool MessageStore::save_index() {
 
 		// Serialize each active conversation from pool
 		for (size_t i = 0; i < MAX_CONVERSATIONS; ++i) {
+			if (empty) break;
 			const ConversationSlot& slot = _conversations_pool[i];
 			if (!slot.in_use) {
 				continue;
@@ -1189,30 +1190,8 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 
 	INFO("Deleting message: " + message_hash.toHex());
 
-	// Remove message file from BOTH hot and archive — the file might
-	// be in either tier (or even both, briefly, if a previous archive
-	// op got past the write but failed the hot delete).
-	std::string message_path = get_message_path(message_hash);
-	if (Utilities::OS::file_exists(message_path.c_str())) {
-		if (!Utilities::OS::remove_file(message_path.c_str())) {
-			ERROR("Failed to delete message file: " + message_path);
-			return false;
-		}
-	}
-	if (_archive_fs) {
-		std::string arch_path = get_archive_message_path(message_hash);
-		if (_archive_fs.exists(arch_path.c_str())) {
-			if (!_archive_fs.remove(arch_path.c_str())) {
-				WARNING("Failed to delete archived message file: " + arch_path);
-				// Hot copy already gone; logical state is "deleted"
-				// even if the archive blob lingers. Don't fail the
-				// caller — better to leave a dangling file than to
-				// abort a delete that the user explicitly asked for.
-			}
-		}
-	}
-
 	// Update conversation index - remove from all conversations
+	ConversationInfo* changed_conversation = nullptr;
 	for (size_t i = 0; i < MAX_CONVERSATIONS; ++i) {
 		ConversationSlot& slot = _conversations_pool[i];
 		if (!slot.in_use) {
@@ -1220,7 +1199,13 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 		}
 
 		ConversationInfo& conv = slot.info;
-		if (conv.remove_message_hash(message_hash)) {
+		if (conv.has_message(message_hash)) {
+			_transaction_snapshot = conv;
+			if (!conv.remove_message_hash(message_hash)) {
+				ERROR("Failed to remove message from in-memory conversation");
+				return false;
+			}
+			changed_conversation = &conv;
 			// Update last message if this was it
 			if (conv.last_message_hash_bytes() == message_hash) {
 				if (conv.message_count > 0) {
@@ -1235,7 +1220,28 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 		}
 	}
 
-	save_index();
+	// Commit the logical deletion before removing payloads. If this fails,
+	// retain both the old in-memory index and all message data.
+	if (changed_conversation && !save_index()) {
+		*changed_conversation = _transaction_snapshot;
+		ERROR("Message deletion index commit failed");
+		return false;
+	}
+
+	// The durable index no longer references this message. Payload cleanup is
+	// now best-effort: a lingering blob is harmless, while deleting it before
+	// the index commit would create a stale entry after reboot.
+	std::string message_path = get_message_path(message_hash);
+	if (Utilities::OS::file_exists(message_path.c_str()) &&
+	    !Utilities::OS::remove_file(message_path.c_str())) {
+		WARNING("Failed to remove unreferenced message file: " + message_path);
+	}
+	if (_archive_fs) {
+		std::string arch_path = get_archive_message_path(message_hash);
+		if (_archive_fs.exists(arch_path.c_str()) && !_archive_fs.remove(arch_path.c_str())) {
+			WARNING("Failed to remove unreferenced archived message file: " + arch_path);
+		}
+	}
 	INFO("Message deleted");
 	return true;
 }
@@ -1305,25 +1311,37 @@ bool MessageStore::delete_conversation(const Bytes& peer_hash) {
 	}
 
 	INFO("Deleting conversation: " + peer_hash.toHex());
+	_transaction_snapshot = slot->info;
 
-	// Delete all message files from BOTH hot and archive.
-	for (size_t i = 0; i < slot->info.message_count; ++i) {
-		Bytes msg_hash = slot->info.message_hash_bytes(i);
+	// Commit the logical deletion first. Restore the in-memory slot when the
+	// transactional index write fails, leaving every payload intact.
+	slot->clear();
+	if (!save_index()) {
+		slot->in_use = true;
+		slot->set_peer_hash(peer_hash);
+		slot->info = _transaction_snapshot;
+		ERROR("Conversation deletion index commit failed");
+		return false;
+	}
+
+	// Delete all now-unreferenced message files from BOTH hot and archive.
+	for (size_t i = 0; i < _transaction_snapshot.message_count; ++i) {
+		Bytes msg_hash = _transaction_snapshot.message_hash_bytes(i);
 		std::string message_path = get_message_path(msg_hash);
 		if (Utilities::OS::file_exists(message_path.c_str())) {
-			Utilities::OS::remove_file(message_path.c_str());
+			if (!Utilities::OS::remove_file(message_path.c_str())) {
+				WARNING("Failed to remove unreferenced message file: " + message_path);
+			}
 		}
 		if (_archive_fs) {
 			std::string arch_path = get_archive_message_path(msg_hash);
 			if (_archive_fs.exists(arch_path.c_str())) {
-				_archive_fs.remove(arch_path.c_str());
+				if (!_archive_fs.remove(arch_path.c_str())) {
+					WARNING("Failed to remove unreferenced archived message file: " + arch_path);
+				}
 			}
 		}
 	}
-
-	// Clear slot and mark as not in use
-	slot->clear();
-	save_index();
 
 	INFO("Conversation deleted");
 	return true;
@@ -1360,7 +1378,15 @@ size_t MessageStore::get_unread_count() const {
 bool MessageStore::clear_all() {
 	INFO("Clearing all message store data");
 
-	// Delete all message files
+	// Persist the empty index without first destroying the in-memory index.
+	// This leaves all state recoverable when the transaction fails and lets us
+	// enumerate payloads only after the logical clear is durable.
+	if (!save_index(true)) {
+		ERROR("Message store clear index commit failed");
+		return false;
+	}
+
+	// Delete all now-unreferenced message files.
 	for (size_t i = 0; i < MAX_CONVERSATIONS; ++i) {
 		ConversationSlot& slot = _conversations_pool[i];
 		if (!slot.in_use) {
@@ -1369,14 +1395,19 @@ bool MessageStore::clear_all() {
 		for (size_t j = 0; j < slot.info.message_count; ++j) {
 			std::string message_path = get_message_path(slot.info.message_hash_bytes(j));
 			if (Utilities::OS::file_exists(message_path.c_str())) {
-				Utilities::OS::remove_file(message_path.c_str());
+				if (!Utilities::OS::remove_file(message_path.c_str())) {
+					WARNING("Failed to remove unreferenced message file: " + message_path);
+				}
+			}
+			if (_archive_fs) {
+				std::string arch_path = get_archive_message_path(slot.info.message_hash_bytes(j));
+				if (_archive_fs.exists(arch_path.c_str()) && !_archive_fs.remove(arch_path.c_str())) {
+					WARNING("Failed to remove unreferenced archived message file: " + arch_path);
+				}
 			}
 		}
 		slot.clear();
 	}
-
-	// Save empty index
-	save_index();
 
 	INFO("Message store cleared");
 	return true;
