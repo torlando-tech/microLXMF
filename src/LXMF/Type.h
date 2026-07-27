@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Type.h>
+#include <microReticulum/Type.h>
 
 #include <stdint.h>
 

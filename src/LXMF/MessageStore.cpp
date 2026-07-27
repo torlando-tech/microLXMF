@@ -1,9 +1,10 @@
 #include "MessageStore.h"
-#include <Log.h>
-#include <Utilities/OS.h>
+#include <microReticulum/Log.h>
+#include <microReticulum/Utilities/OS.h>
 
 #include <ArduinoJson.h>
 #include <algorithm>
+#include <set>
 #include <sstream>
 
 using namespace LXMF;
@@ -84,8 +85,7 @@ MessageStore::MessageStore(const std::string& base_path) :
 		_conversations_pool[i].clear();
 	}
 
-	if (initialize_storage()) {
-		load_index();
+	if (initialize_storage() && load_index()) {
 		_initialized = true;
 		INFO("MessageStore initialized with " + std::to_string(count_conversations()) + " conversations");
 	} else {
@@ -111,21 +111,59 @@ bool MessageStore::initialize_storage() {
 	return true;
 }
 
-// Load conversation index from disk
-void MessageStore::load_index() {
+bool MessageStore::load_index() {
 	std::string index_path = "/conv.json";  // Short path for SPIFFS
-
-	if (!Utilities::OS::file_exists(index_path.c_str())) {
-		DEBUG("No existing conversation index found");
-		return;
+	std::string temp_path = "/conv.tmp";
+	std::string backup_path = "/conv.bak";
+	if (Utilities::OS::file_exists(temp_path.c_str())) {
+		Utilities::OS::remove_file(temp_path.c_str());
 	}
+
+	bool has_index = Utilities::OS::file_exists(index_path.c_str());
+	bool has_backup = Utilities::OS::file_exists(backup_path.c_str());
+	if (!has_index && !has_backup) {
+		DEBUG("No existing conversation index found");
+		return true;
+	}
+
+	if (has_index && load_index_file(index_path)) {
+		if (has_backup) Utilities::OS::remove_file(backup_path.c_str());
+		return true;
+	}
+
+	if (has_backup && load_index_file(backup_path)) {
+		if (has_index && !Utilities::OS::remove_file(index_path.c_str())) {
+			ERROR("Failed to remove invalid conversation index during recovery");
+			return false;
+		}
+		if (!Utilities::OS::rename_file(backup_path.c_str(), index_path.c_str())) {
+			ERROR("Failed to restore validated conversation index backup");
+			return false;
+		}
+		INFO("Recovered conversation index from validated backup");
+		return true;
+	}
+
+	ERROR("No valid conversation index generation is available");
+	return false;
+}
+
+// Parse one index generation. The caller decides whether live or backup wins.
+bool MessageStore::load_index_file(const std::string& index_path) {
+	auto reject_index = [this](const std::string& reason) {
+		ERROR(reason);
+		for (size_t i = 0; i < MAX_CONVERSATIONS; ++i) {
+			_conversations_pool[i].clear();
+		}
+		return false;
+	};
 
 	try {
 		// Read JSON file via OS abstraction (SPIFFS compatible)
 		Bytes data;
 		if (Utilities::OS::read_file(index_path.c_str(), data) == 0) {
-			WARNING("Failed to read index file or empty: " + index_path);
-			return;
+			ERROR("Failed to read index file or index is empty: " + index_path);
+			return false;
 		}
 
 		// Parse JSON from bytes using reusable document to reduce heap fragmentation
@@ -134,38 +172,62 @@ void MessageStore::load_index() {
 
 		if (error) {
 			ERROR("Failed to parse conversation index: " + std::string(error.c_str()));
-			return;
+			return false;
 		}
 
 		// Load conversations into pool
+		if (!_json_doc["conversations"].is<JsonArray>()) {
+			return reject_index("Conversation index has no conversations array");
+		}
 		JsonArray conversations = _json_doc["conversations"].as<JsonArray>();
+		if (conversations.size() > MAX_CONVERSATIONS) {
+			return reject_index("Conversation index exceeds fixed pool capacity");
+		}
+		std::set<std::string> peer_hashes;
+		std::set<std::string> message_hashes;
 		size_t slot_index = 0;
 		for (JsonObject conv : conversations) {
-			if (slot_index >= MAX_CONVERSATIONS) {
-				WARNING("Too many conversations in index, some will be skipped");
-				break;
-			}
-
 			ConversationSlot& slot = _conversations_pool[slot_index];
-			slot.in_use = true;
 
 			// Parse peer hash
 			const char* peer_hex = conv["peer_hash"];
+			if (!peer_hex) {
+				return reject_index("Conversation index entry has no peer hash");
+			}
 			Bytes peer_bytes;
 			peer_bytes.assignHex(peer_hex);
+			if (peer_bytes.size() != PEER_HASH_SIZE) {
+				return reject_index("Conversation index entry has invalid peer hash");
+			}
+			if (!peer_hashes.insert(peer_bytes.toHex()).second) {
+				return reject_index("Conversation index contains a duplicate peer hash");
+			}
+			slot.in_use = true;
 			slot.set_peer_hash(peer_bytes);
 			slot.info.set_peer_hash(peer_bytes);
 
 			// Parse message hashes
+			if (!conv["messages"].is<JsonArray>()) {
+				return reject_index("Conversation index entry has no messages array");
+			}
 			JsonArray messages = conv["messages"].as<JsonArray>();
+			if (messages.size() > MAX_MESSAGES_PER_CONVERSATION) {
+				return reject_index("Conversation index entry exceeds message capacity");
+			}
+			std::set<std::string> conversation_messages;
 			for (const char* msg_hex : messages) {
-				if (slot.info.message_count >= MAX_MESSAGES_PER_CONVERSATION) {
-					WARNING("Too many messages in conversation, some will be skipped");
-					break;
-				}
+				if (!msg_hex) return reject_index("Conversation index has a null message hash");
 				Bytes msg_hash;
 				msg_hash.assignHex(msg_hex);
-				slot.info.add_message_hash(msg_hash);
+				if (msg_hash.size() != MESSAGE_HASH_SIZE) {
+					return reject_index("Conversation index has an invalid message hash");
+				}
+				std::string canonical_hash = msg_hash.toHex();
+				if (!conversation_messages.insert(canonical_hash).second ||
+				    !message_hashes.insert(canonical_hash).second ||
+				    !slot.info.add_message_hash(msg_hash)) {
+					return reject_index("Conversation index contains a duplicate message hash");
+				}
 			}
 
 			// Parse metadata
@@ -174,8 +236,15 @@ void MessageStore::load_index() {
 
 			if (!conv["last_message_hash"].isNull()) {
 				const char* last_msg_hex = conv["last_message_hash"];
+				if (!last_msg_hex) return reject_index("Conversation index has a null last-message hash");
 				Bytes last_msg_bytes;
 				last_msg_bytes.assignHex(last_msg_hex);
+				if (last_msg_bytes.size() != MESSAGE_HASH_SIZE) {
+					return reject_index("Conversation index has an invalid last-message hash");
+				}
+				if (conversation_messages.count(last_msg_bytes.toHex()) == 0) {
+					return reject_index("Last-message hash is not present in its conversation");
+				}
 				slot.info.set_last_message_hash(last_msg_bytes);
 			}
 
@@ -197,15 +266,18 @@ void MessageStore::load_index() {
 		}
 
 		DEBUG("Loaded " + std::to_string(count_conversations()) + " conversations from index");
+		return true;
 
 	} catch (const std::exception& e) {
-		ERROR("Exception loading conversation index: " + std::string(e.what()));
+		return reject_index("Exception loading conversation index: " + std::string(e.what()));
 	}
 }
 
 // Save conversation index to disk
-bool MessageStore::save_index() {
+bool MessageStore::save_index(bool empty) {
 	std::string index_path = "/conv.json";  // Short path for SPIFFS
+	std::string temp_path = "/conv.tmp";
+	std::string backup_path = "/conv.bak";
 
 	try {
 		// Use reusable document to reduce heap fragmentation
@@ -214,6 +286,7 @@ bool MessageStore::save_index() {
 
 		// Serialize each active conversation from pool
 		for (size_t i = 0; i < MAX_CONVERSATIONS; ++i) {
+			if (empty) break;
 			const ConversationSlot& slot = _conversations_pool[i];
 			if (!slot.in_use) {
 				continue;
@@ -249,9 +322,51 @@ bool MessageStore::save_index() {
 		serializeJsonPretty(_json_doc, json_str);
 		Bytes data((const uint8_t*)json_str.data(), json_str.size());
 
-		if (Utilities::OS::write_file(index_path.c_str(), data) != data.size()) {
-			ERROR("Failed to write index file: " + index_path);
+		// Never truncate the only committed index in place. Write and verify a
+		// temporary file, then replace the index with a recoverable two-rename
+		// transaction. load_index() restores /conv.bak after an interrupted boot.
+		if (Utilities::OS::write_file(temp_path.c_str(), data) != data.size()) {
+			ERROR("Failed to write temporary index file: " + temp_path);
+			Utilities::OS::remove_file(temp_path.c_str());
 			return false;
+		}
+
+		Bytes verify;
+		if (Utilities::OS::read_file(temp_path.c_str(), verify) != data.size() ||
+		    verify.size() != data.size() ||
+		    memcmp(verify.data(), data.data(), data.size()) != 0) {
+			ERROR("Failed to verify temporary conversation index");
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		_json_doc.clear();
+		if (deserializeJson(_json_doc, verify.data(), verify.size()) ||
+		    !_json_doc["conversations"].is<JsonArray>()) {
+			ERROR("Temporary conversation index failed parse validation");
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+
+		if (Utilities::OS::file_exists(backup_path.c_str())) {
+			Utilities::OS::remove_file(backup_path.c_str());
+		}
+		bool had_index = Utilities::OS::file_exists(index_path.c_str());
+		if (had_index &&
+		    !Utilities::OS::rename_file(index_path.c_str(), backup_path.c_str())) {
+			ERROR("Failed to preserve previous conversation index");
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		if (!Utilities::OS::rename_file(temp_path.c_str(), index_path.c_str())) {
+			ERROR("Failed to commit conversation index");
+			if (had_index) {
+				Utilities::OS::rename_file(backup_path.c_str(), index_path.c_str());
+			}
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		if (had_index) {
+			Utilities::OS::remove_file(backup_path.c_str());
 		}
 
 		DEBUG("Saved conversation index");
@@ -271,6 +386,29 @@ bool MessageStore::save_message(const LXMessage& message) {
 	}
 
 	INFO("Saving message: " + message.hash().toHex());
+	std::string message_path = get_message_path(message.hash());
+	size_t extension_pos = message_path.rfind('.');
+	std::string message_stem = message_path.substr(0, extension_pos);
+	std::string temp_message_path = message_stem + ".tmp";
+	std::string backup_message_path = message_stem + ".bak";
+	bool had_payload = false;
+	bool payload_committed = false;
+	bool index_committed = false;
+	ConversationSlot* transaction_slot = nullptr;
+	bool conversation_snapshot = false;
+	bool created_conversation = false;
+	auto rollback_payload = [&]() {
+		if (!payload_committed) return;
+		Utilities::OS::remove_file(message_path.c_str());
+		if (had_payload) {
+			if (!Utilities::OS::rename_file(backup_message_path.c_str(), message_path.c_str())) {
+				ERROR("Failed to restore previous message payload after rollback");
+			}
+		} else if (Utilities::OS::file_exists(backup_message_path.c_str())) {
+			Utilities::OS::remove_file(backup_message_path.c_str());
+		}
+		payload_committed = false;
+	};
 
 	try {
 		// Use reusable document to reduce heap fragmentation
@@ -291,16 +429,88 @@ bool MessageStore::save_message(const LXMessage& message) {
 		// This ensures exact reconstruction on load
 		_json_doc["packed"] = message.packed().toHex();
 
-		// Write message file via OS abstraction (SPIFFS compatible)
-		std::string message_path = get_message_path(message.hash());
 		std::string json_str;
 		serializeJsonPretty(_json_doc, json_str);
 		Bytes data((const uint8_t*)json_str.data(), json_str.size());
 
-		if (Utilities::OS::write_file(message_path.c_str(), data) != data.size()) {
-			ERROR("Failed to write message file: " + message_path);
+		// Validate both generations before discarding either one. This also
+		// rejects a different full hash sharing the shortened filename.
+		bool has_payload_generation =
+			Utilities::OS::file_exists(message_path.c_str()) ||
+			Utilities::OS::file_exists(backup_message_path.c_str());
+		if (has_payload_generation &&
+		    !recover_message_payload(message_path, message.hash())) {
 			return false;
 		}
+		had_payload = Utilities::OS::file_exists(message_path.c_str());
+
+		if (_archive_fs) {
+			std::string archive_path = get_archive_message_path(message.hash());
+			size_t archive_extension = archive_path.rfind('.');
+			std::string archive_backup = archive_path.substr(0, archive_extension) + ".bak";
+			bool has_archive_generation = _archive_fs.exists(archive_path.c_str()) ||
+			                              _archive_fs.exists(archive_backup.c_str());
+			if (has_archive_generation) {
+				if (!recover_archived_message_payload(message.hash())) return false;
+				Bytes archived;
+				if (read_archive_file(archive_path.c_str(), archived) == 0) {
+					ERROR("Archived message payload is unreadable; refusing overwrite");
+					return false;
+				}
+				_json_doc.clear();
+				if (deserializeJson(_json_doc, archived.data(), archived.size())) {
+					ERROR("Archived message payload is malformed; refusing overwrite");
+					return false;
+				}
+				const char* archived_hash = _json_doc["hash"];
+				if (!archived_hash || message.hash().toHex() != archived_hash) {
+					ERROR("Archived message filename collision detected");
+					return false;
+				}
+			}
+		}
+
+		if (Utilities::OS::write_file(temp_message_path.c_str(), data) != data.size()) {
+			ERROR("Failed to write temporary message file: " + temp_message_path);
+			Utilities::OS::remove_file(temp_message_path.c_str());
+			return false;
+		}
+		Bytes verify_payload;
+		if (Utilities::OS::read_file(temp_message_path.c_str(), verify_payload) != data.size() ||
+		    verify_payload.size() != data.size() ||
+		    memcmp(verify_payload.data(), data.data(), data.size()) != 0) {
+			ERROR("Failed to verify temporary message payload");
+			Utilities::OS::remove_file(temp_message_path.c_str());
+			return false;
+		}
+		_json_doc.clear();
+		if (deserializeJson(_json_doc, verify_payload.data(), verify_payload.size())) {
+			ERROR("Temporary message payload is malformed");
+			Utilities::OS::remove_file(temp_message_path.c_str());
+			return false;
+		}
+		const char* verified_hash = _json_doc["hash"];
+		if (!verified_hash || message.hash().toHex() != verified_hash) {
+			ERROR("Temporary message payload hash validation failed");
+			Utilities::OS::remove_file(temp_message_path.c_str());
+			return false;
+		}
+
+		if (had_payload &&
+		    !Utilities::OS::rename_file(message_path.c_str(), backup_message_path.c_str())) {
+			ERROR("Failed to preserve previous message payload");
+			Utilities::OS::remove_file(temp_message_path.c_str());
+			return false;
+		}
+		if (!Utilities::OS::rename_file(temp_message_path.c_str(), message_path.c_str())) {
+			ERROR("Failed to commit message payload");
+			if (had_payload) {
+				Utilities::OS::rename_file(backup_message_path.c_str(), message_path.c_str());
+			}
+			Utilities::OS::remove_file(temp_message_path.c_str());
+			return false;
+		}
+		payload_committed = true;
 
 		DEBUG("  Message file saved: " + message_path);
 
@@ -310,26 +520,43 @@ bool MessageStore::save_message(const LXMessage& message) {
 		Bytes peer_hash = message.incoming() ? message.source_hash() : message.destination_hash();
 
 		// Get or create conversation slot
-		ConversationSlot* slot = get_or_create_conversation(peer_hash);
-		if (!slot) {
+		transaction_slot = find_conversation(peer_hash);
+		created_conversation = (transaction_slot == nullptr);
+		if (!transaction_slot) {
+			transaction_slot = get_or_create_conversation(peer_hash);
+		}
+		if (!transaction_slot) {
 			ERROR("Conversation pool is full, cannot add message");
+			rollback_payload();
 			return false;
 		}
 
-		ConversationInfo& conv = slot->info;
+		ConversationInfo& conv = transaction_slot->info;
+		_transaction_snapshot = conv;
+		conversation_snapshot = true;
 
 		// Add message to conversation (if not already present)
 		bool already_exists = conv.has_message(message.hash());
+		Bytes evicted_hash;
 
 		if (!already_exists) {
-			// Hard-cap: if the in-memory hash list is at MAX, evict
-			// the oldest entry (frees one slot AND its archived file
-			// on the SD card) so new messages aren't silently dropped.
+			// Hard-cap: remove the oldest hash from the candidate index, but
+			// defer deleting its payload until the new index commits. This
+			// keeps rollback possible when storage fails.
 			if (conv.message_count >= MAX_MESSAGES_PER_CONVERSATION) {
-				evict_oldest_message(conv);
+				evicted_hash = conv.message_hash_bytes(0);
+				if (!evicted_hash || !conv.remove_message_hash(evicted_hash)) {
+					ERROR("Unable to reserve conversation slot for new message");
+					rollback_payload();
+					conv = _transaction_snapshot;
+					return false;
+				}
 			}
 			if (!conv.add_message_hash(message.hash())) {
-				WARNING("Message pool full for conversation: " + peer_hash.toHex());
+				ERROR("Message pool full for conversation: " + peer_hash.toHex());
+				rollback_payload();
+				conv = _transaction_snapshot;
+				return false;
 			} else {
 				conv.last_activity = message.timestamp();
 				conv.set_last_message_hash(message.hash());
@@ -343,8 +570,41 @@ bool MessageStore::save_message(const LXMessage& message) {
 			}
 		}
 
-		// Save updated index
-		save_index();
+		// A message is durable only when both its payload and the conversation
+		// index are committed. Roll back the in-memory mutation and orphaned
+		// payload when the index transaction fails.
+		if (!save_index()) {
+			ERROR("Message payload written but conversation index commit failed");
+			rollback_payload();
+			if (created_conversation) {
+				transaction_slot->clear();
+			} else {
+				conv = _transaction_snapshot;
+			}
+			return false;
+		}
+		index_committed = true;
+		if (had_payload && Utilities::OS::file_exists(backup_message_path.c_str())) {
+			Utilities::OS::remove_file(backup_message_path.c_str());
+		}
+		payload_committed = false;
+
+		// The replacement index is now durable. It is safe to remove the
+		// hard-cap payload that the committed index no longer references.
+		if (evicted_hash) {
+			std::string hot_path = get_message_path(evicted_hash);
+			if (Utilities::OS::file_exists(hot_path.c_str())) {
+				Utilities::OS::remove_file(hot_path.c_str());
+			}
+			if (_archive_fs) {
+				std::string archive_path = get_archive_message_path(evicted_hash);
+				if (_archive_fs.exists(archive_path.c_str())) {
+					_archive_fs.remove(archive_path.c_str());
+				}
+			}
+			INFO("Hard-cap evicted committed message "
+			     + evicted_hash.toHex().substr(0, 16) + "...");
+		}
 
 		// Cull this conversation down to HOT_MESSAGES_PER_CONVERSATION:
 		// older messages are MOVED to the archive filesystem if one
@@ -358,6 +618,15 @@ bool MessageStore::save_message(const LXMessage& message) {
 		return true;
 
 	} catch (const std::exception& e) {
+		if (index_committed) {
+			ERROR("Post-commit message cleanup failed: " + std::string(e.what()));
+			return true;
+		}
+		rollback_payload();
+		if (conversation_snapshot && transaction_slot) {
+			if (created_conversation) transaction_slot->clear();
+			else transaction_slot->info = _transaction_snapshot;
+		}
 		ERROR("Exception saving message: " + std::string(e.what()));
 		return false;
 	}
@@ -453,75 +722,84 @@ size_t MessageStore::write_archive_file(const char* path, const Bytes& data) {
 bool MessageStore::archive_one_message(const Bytes& message_hash) {
 	std::string hot_path = get_message_path(message_hash);
 	if (!Utilities::OS::file_exists(hot_path.c_str())) {
-		// Already gone (eg previously archived in a prior session).
-		// Treat as success — the only side effect we care about is
-		// "this hash no longer occupies hot flash."
 		return true;
 	}
 
-	// If we have an archive, copy hot→archive before deleting the hot
-	// copy. If the archive write fails, leave the hot copy alone so
-	// the message isn't lost. If we have no archive, just delete the
-	// hot copy (bounded in-flash storage, no historical scrollback).
 	if (_archive_fs) {
 		Bytes data;
 		if (Utilities::OS::read_file(hot_path.c_str(), data) == 0) {
-			WARNING("archive_one_message: read_file(hot) returned 0 for "
-			        + hot_path);
+			WARNING("archive_one_message: unable to read hot payload " + hot_path);
 			return false;
 		}
+		_json_doc.clear();
+		if (deserializeJson(_json_doc, data.data(), data.size())) return false;
+		const char* hot_hash = _json_doc["hash"];
+		if (!hot_hash || message_hash.toHex() != hot_hash) {
+			ERROR("archive_one_message: hot filename collision detected");
+			return false;
+		}
+
 		std::string arch_path = get_archive_message_path(message_hash);
-		size_t written = write_archive_file(arch_path.c_str(), data);
-		if (written != data.size()) {
-			WARNING("archive_one_message: archive write short ("
-			        + std::to_string(written) + "/"
-			        + std::to_string(data.size()) + " bytes) for "
-			        + arch_path + " — keeping hot copy");
+		size_t extension_pos = arch_path.rfind('.');
+		std::string stem = arch_path.substr(0, extension_pos);
+		std::string temp_path = stem + ".tmp";
+		std::string backup_path = stem + ".bak";
+		bool has_archive_generation = _archive_fs.exists(arch_path.c_str()) ||
+		                              _archive_fs.exists(backup_path.c_str());
+		if (has_archive_generation &&
+		    !recover_archived_message_payload(message_hash)) return false;
+		bool had_archive = _archive_fs.exists(arch_path.c_str());
+		if (had_archive) {
+			Bytes existing;
+			if (read_archive_file(arch_path.c_str(), existing) == 0) return false;
+			_json_doc.clear();
+			if (deserializeJson(_json_doc, existing.data(), existing.size())) return false;
+			const char* archived_hash = _json_doc["hash"];
+			if (!archived_hash || message_hash.toHex() != archived_hash) {
+				ERROR("archive_one_message: archive filename collision detected");
+				return false;
+			}
+		}
+
+		_archive_fs.remove(temp_path.c_str());
+		_archive_fs.remove(backup_path.c_str());
+		if (write_archive_file(temp_path.c_str(), data) != data.size()) {
+			_archive_fs.remove(temp_path.c_str());
 			return false;
 		}
+		Bytes verify;
+		if (read_archive_file(temp_path.c_str(), verify) != data.size()) {
+			_archive_fs.remove(temp_path.c_str());
+			return false;
+		}
+		_json_doc.clear();
+		if (deserializeJson(_json_doc, verify.data(), verify.size())) {
+			_archive_fs.remove(temp_path.c_str());
+			return false;
+		}
+		const char* verified_hash = _json_doc["hash"];
+		if (!verified_hash || message_hash.toHex() != verified_hash) {
+			_archive_fs.remove(temp_path.c_str());
+			return false;
+		}
+		if (had_archive && !_archive_fs.rename(arch_path.c_str(), backup_path.c_str())) {
+			_archive_fs.remove(temp_path.c_str());
+			return false;
+		}
+		if (!_archive_fs.rename(temp_path.c_str(), arch_path.c_str())) {
+			if (had_archive) _archive_fs.rename(backup_path.c_str(), arch_path.c_str());
+			_archive_fs.remove(temp_path.c_str());
+			return false;
+		}
+		if (had_archive) _archive_fs.remove(backup_path.c_str());
 		DEBUG("archive_one_message: " + message_hash.toHex().substr(0, 16)
-		      + "... → archive (" + std::to_string(written) + " bytes)");
+		      + "... committed to archive");
 	}
 
-	// Delete from hot. If this fails the message exists in BOTH places,
-	// which is wasteful but not corrupting; the next compaction sweeps
-	// it. We log for visibility.
 	if (!Utilities::OS::remove_file(hot_path.c_str())) {
-		WARNING("archive_one_message: remove_file(hot) failed for "
-		        + hot_path);
+		WARNING("archive_one_message: remove_file(hot) failed for " + hot_path);
 	}
 	return true;
-}
-
-bool MessageStore::evict_oldest_message(ConversationInfo& conv) {
-	if (conv.message_count == 0) return false;
-
-	// Index 0 is the oldest message in the conversation. With cull
-	// running on every save, index 0 is normally already in archive
-	// (or evicted entirely if no archive_fs is set). Either way, we
-	// want it gone from BOTH tiers and from the in-memory list.
-	Bytes oldest = conv.message_hash_bytes(0);
-	if (oldest.size() == 0) return false;
-
-	// Hot — likely already gone, but check & remove for safety.
-	std::string hot_path = get_message_path(oldest);
-	if (Utilities::OS::file_exists(hot_path.c_str())) {
-		Utilities::OS::remove_file(hot_path.c_str());
-	}
-	// Archive — the actual storage location for old messages.
-	if (_archive_fs) {
-		std::string arch_path = get_archive_message_path(oldest);
-		if (_archive_fs.exists(arch_path.c_str())) {
-			_archive_fs.remove(arch_path.c_str());
-		}
-	}
-	// Drop from the in-memory hash list (shifts all indices down).
-	bool removed = conv.remove_message_hash(oldest);
-	if (removed) {
-		INFO("evict_oldest_message: hard-cap evicted "
-		     + oldest.toHex().substr(0, 16) + "...");
-	}
-	return removed;
 }
 
 void MessageStore::cull_conversation_to_hot(const Bytes& peer_hash) {
@@ -549,6 +827,75 @@ void MessageStore::cull_conversation_to_hot(const Bytes& peer_hash) {
 	}
 }
 
+bool MessageStore::recover_message_payload(const std::string& message_path,
+                                           const Bytes& expected_hash) {
+	size_t extension_pos = message_path.rfind('.');
+	std::string stem = message_path.substr(0, extension_pos);
+	std::string temp_path = stem + ".tmp";
+	std::string backup_path = stem + ".bak";
+	bool has_payload = Utilities::OS::file_exists(message_path.c_str());
+	bool has_backup = Utilities::OS::file_exists(backup_path.c_str());
+	auto valid_payload = [&](const std::string& path) {
+		Bytes data;
+		if (Utilities::OS::read_file(path.c_str(), data) == 0) return false;
+		_json_doc.clear();
+		if (deserializeJson(_json_doc, data.data(), data.size())) return false;
+		const char* stored_hash = _json_doc["hash"];
+		return stored_hash && expected_hash.toHex() == stored_hash;
+	};
+
+	if (has_payload && valid_payload(message_path)) {
+		if (has_backup) Utilities::OS::remove_file(backup_path.c_str());
+	} else if (has_backup && valid_payload(backup_path)) {
+		if (has_payload && !Utilities::OS::remove_file(message_path.c_str())) {
+			ERROR("Failed to remove invalid message payload during recovery");
+			return false;
+		}
+		if (!Utilities::OS::rename_file(backup_path.c_str(), message_path.c_str())) {
+			ERROR("Failed to restore validated message payload backup");
+			return false;
+		}
+		has_payload = true;
+	} else if (has_payload || has_backup) {
+		ERROR("No valid message payload generation is available");
+		return false;
+	}
+	if (Utilities::OS::file_exists(temp_path.c_str())) {
+		Utilities::OS::remove_file(temp_path.c_str());
+	}
+	return has_payload;
+}
+
+bool MessageStore::recover_archived_message_payload(const Bytes& expected_hash) {
+	if (!_archive_fs) return false;
+	std::string path = get_archive_message_path(expected_hash);
+	size_t extension_pos = path.rfind('.');
+	std::string stem = path.substr(0, extension_pos);
+	std::string temp = stem + ".tmp";
+	std::string backup = stem + ".bak";
+	bool has_payload = _archive_fs.exists(path.c_str());
+	bool has_backup = _archive_fs.exists(backup.c_str());
+	auto valid = [&](const std::string& candidate) {
+		Bytes data;
+		if (read_archive_file(candidate.c_str(), data) == 0) return false;
+		_json_doc.clear();
+		if (deserializeJson(_json_doc, data.data(), data.size())) return false;
+		const char* stored_hash = _json_doc["hash"];
+		return stored_hash && expected_hash.toHex() == stored_hash;
+	};
+	if (has_payload && valid(path)) {
+		if (has_backup) _archive_fs.remove(backup.c_str());
+	} else if (has_backup && valid(backup)) {
+		if (has_payload && !_archive_fs.remove(path.c_str())) return false;
+		if (!_archive_fs.rename(backup.c_str(), path.c_str())) return false;
+		has_payload = true;
+	} else if (has_payload || has_backup) {
+		return false;
+	}
+	if (_archive_fs.exists(temp.c_str())) _archive_fs.remove(temp.c_str());
+	return has_payload;
+}
+
 // Load message from storage
 LXMessage MessageStore::load_message(const Bytes& message_hash) {
 	if (!_initialized) {
@@ -562,9 +909,8 @@ LXMessage MessageStore::load_message(const Bytes& message_hash) {
 	// only consulted on a hot miss, so the common case (recent
 	// scrollback within HOT_MESSAGES_PER_CONVERSATION) stays a
 	// single internal-flash read.
-	bool in_hot = Utilities::OS::file_exists(message_path.c_str());
-	bool in_archive = !in_hot && _archive_fs
-	                  && _archive_fs.exists(get_archive_message_path(message_hash).c_str());
+	bool in_hot = recover_message_payload(message_path, message_hash);
+	bool in_archive = !in_hot && recover_archived_message_payload(message_hash);
 
 	if (!in_hot && !in_archive) {
 		WARNING("Message file not found: " + message_path
@@ -595,6 +941,11 @@ LXMessage MessageStore::load_message(const Bytes& message_hash) {
 			ERROR("Failed to parse message file: " + std::string(error.c_str()));
 			return LXMessage(Bytes(), Bytes(), Bytes(), Bytes());
 		}
+		const char* stored_hash = _json_doc["hash"];
+		if (!stored_hash || message_hash.toHex() != stored_hash) {
+			ERROR("Loaded message payload does not match requested full hash");
+			return LXMessage(Bytes(), Bytes(), Bytes(), Bytes());
+		}
 
 		// Unpack the message from stored packed bytes
 		// This preserves the exact hash and signature
@@ -607,6 +958,9 @@ LXMessage MessageStore::load_message(const Bytes& message_hash) {
 		// Restore incoming flag from storage (unpack_from_bytes defaults to true)
 		if (!_json_doc["incoming"].isNull()) {
 			message.incoming(_json_doc["incoming"].as<bool>());
+		}
+		if (!_json_doc["state"].isNull()) {
+			message.state(static_cast<Type::Message::State>(_json_doc["state"].as<int>()));
 		}
 
 		DEBUG("Loaded message: " + message_hash.toHex());
@@ -629,20 +983,23 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 
 	std::string message_path = get_message_path(message_hash);
 
-	// Two-phase read: hot first, then archive (same pattern as load_message).
-	bool in_hot = Utilities::OS::file_exists(message_path.c_str());
-	bool in_archive = !in_hot && _archive_fs
-	                  && _archive_fs.exists(get_archive_message_path(message_hash).c_str());
-	if (!in_hot && !in_archive) {
-		return meta;
-	}
-
 	try {
+		// Read the hot file directly. read_file() returns 0 for a missing file
+		// (filesystem.size()==0, no error), so a separate file_exists() probe is
+		// unnecessary — that probe was a third LittleFS open per message (after
+		// size() + readFile()), and opens dominate conversation-load time. Fall
+		// back to the archive only when the hot read comes up empty.
 		Bytes data;
-		size_t n_read = 0;
-		if (in_hot) {
+		size_t extension_pos = message_path.rfind('.');
+		std::string backup_path = message_path.substr(0, extension_pos) + ".bak";
+		if (Utilities::OS::file_exists(backup_path.c_str())) {
+			recover_message_payload(message_path, message_hash);
+		}
+		size_t n_read = Utilities::OS::read_file(message_path.c_str(), data);
+		if (n_read == 0 && recover_message_payload(message_path, message_hash)) {
 			n_read = Utilities::OS::read_file(message_path.c_str(), data);
-		} else {
+		}
+		if (n_read == 0 && recover_archived_message_payload(message_hash)) {
 			std::string arch_path = get_archive_message_path(message_hash);
 			n_read = read_archive_file(arch_path.c_str(), data);
 		}
@@ -650,13 +1007,24 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 			return meta;
 		}
 
-		// Use reusable document to reduce heap fragmentation
+		// Parse only the metadata fields, skipping the large "packed" hex blob
+		// (the full message payload) — filtering stops deserializeJson from
+		// walking the biggest value in the document.
+		JsonDocument filter;
+		filter["hash"] = true;
+		filter["content"] = true;
+		filter["timestamp"] = true;
+		filter["incoming"] = true;
+		filter["state"] = true;
 		_json_doc.clear();
-		DeserializationError error = deserializeJson(_json_doc, data.data(), data.size());
+		DeserializationError error = deserializeJson(_json_doc, data.data(), data.size(),
+		                                             DeserializationOption::Filter(filter));
 
 		if (error) {
 			return meta;
 		}
+		const char* stored_hash = _json_doc["hash"];
+		if (!stored_hash || message_hash.toHex() != stored_hash) return meta;
 
 		meta.hash = message_hash;
 
@@ -676,6 +1044,56 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 	}
 }
 
+bool MessageStore::update_archived_message_state(
+    const Bytes& message_hash, Type::Message::State state) {
+	std::string path = get_archive_message_path(message_hash);
+	Bytes data;
+	if (read_archive_file(path.c_str(), data) == 0) return false;
+	_json_doc.clear();
+	if (deserializeJson(_json_doc, data.data(), data.size())) return false;
+	const char* stored_hash = _json_doc["hash"];
+	if (!stored_hash || message_hash.toHex() != stored_hash) {
+		ERROR("Archived state update rejected due to filename collision");
+		return false;
+	}
+	_json_doc["state"] = static_cast<int>(state);
+	std::string json;
+	serializeJson(_json_doc, json);
+	Bytes replacement((const uint8_t*)json.data(), json.size());
+	size_t extension_pos = path.rfind('.');
+	std::string stem = path.substr(0, extension_pos);
+	std::string temp = stem + ".tmp";
+	std::string backup = stem + ".bak";
+	_archive_fs.remove(temp.c_str());
+	_archive_fs.remove(backup.c_str());
+	if (write_archive_file(temp.c_str(), replacement) != replacement.size()) {
+		_archive_fs.remove(temp.c_str());
+		return false;
+	}
+	Bytes verify;
+	if (read_archive_file(temp.c_str(), verify) != replacement.size()) {
+		_archive_fs.remove(temp.c_str());
+		return false;
+	}
+	_json_doc.clear();
+	if (deserializeJson(_json_doc, verify.data(), verify.size()) ||
+	    (_json_doc["state"] | -1) != static_cast<int>(state)) {
+		_archive_fs.remove(temp.c_str());
+		return false;
+	}
+	if (!_archive_fs.rename(path.c_str(), backup.c_str())) {
+		_archive_fs.remove(temp.c_str());
+		return false;
+	}
+	if (!_archive_fs.rename(temp.c_str(), path.c_str())) {
+		_archive_fs.rename(backup.c_str(), path.c_str());
+		_archive_fs.remove(temp.c_str());
+		return false;
+	}
+	_archive_fs.remove(backup.c_str());
+	return true;
+}
+
 // Update message state in storage
 bool MessageStore::update_message_state(const Bytes& message_hash, Type::Message::State state) {
 	if (!_initialized) {
@@ -685,46 +1103,74 @@ bool MessageStore::update_message_state(const Bytes& message_hash, Type::Message
 
 	std::string message_path = get_message_path(message_hash);
 
-	if (!Utilities::OS::file_exists(message_path.c_str())) {
-		// State updates only matter for messages still in flight (DELIVERED,
-		// FAILED, etc). Once a message is archived it's terminal — silently
-		// skip the update rather than thrashing the SD card with a 1-byte
-		// rewrite.
-		if (_archive_fs && _archive_fs.exists(get_archive_message_path(message_hash).c_str())) {
-			DEBUG("update_message_state: skipping archived message "
-			      + message_hash.toHex().substr(0, 16) + "...");
-			return true;
+	if (!recover_message_payload(message_path, message_hash)) {
+		if (recover_archived_message_payload(message_hash)) {
+			return update_archived_message_state(message_hash, state);
 		}
 		WARNING("Message file not found: " + message_path);
 		return false;
 	}
 
 	try {
-		// Read existing JSON
 		Bytes data;
 		if (Utilities::OS::read_file(message_path.c_str(), data) == 0) {
 			ERROR("Failed to read message file: " + message_path);
 			return false;
 		}
 
-		// Use reusable document to reduce heap fragmentation
 		_json_doc.clear();
 		DeserializationError error = deserializeJson(_json_doc, data.data(), data.size());
 		if (error) {
 			ERROR("Failed to parse message file: " + std::string(error.c_str()));
 			return false;
 		}
-
-		// Update state
-		_json_doc["state"] = static_cast<int>(state);
-
-		// Write back
-		std::string json_str;
-		serializeJson(_json_doc, json_str);
-		if (!Utilities::OS::write_file(message_path.c_str(), Bytes((uint8_t*)json_str.c_str(), json_str.length()))) {
-			ERROR("Failed to write message file: " + message_path);
+		const char* stored_hash = _json_doc["hash"];
+		if (!stored_hash || message_hash.toHex() != stored_hash) {
+			ERROR("Message state update rejected due to filename collision");
 			return false;
 		}
+		_json_doc["state"] = static_cast<int>(state);
+
+		std::string json_str;
+		serializeJson(_json_doc, json_str);
+		Bytes replacement((const uint8_t*)json_str.data(), json_str.size());
+		size_t extension_pos = message_path.rfind('.');
+		std::string stem = message_path.substr(0, extension_pos);
+		std::string temp_path = stem + ".tmp";
+		std::string backup_path = stem + ".bak";
+		Utilities::OS::remove_file(temp_path.c_str());
+		Utilities::OS::remove_file(backup_path.c_str());
+		if (Utilities::OS::write_file(temp_path.c_str(), replacement) != replacement.size()) {
+			ERROR("Failed to write temporary message-state payload");
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		Bytes verify;
+		if (Utilities::OS::read_file(temp_path.c_str(), verify) != replacement.size() ||
+		    verify.size() != replacement.size()) {
+			ERROR("Failed to verify temporary message-state payload");
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		_json_doc.clear();
+		if (deserializeJson(_json_doc, verify.data(), verify.size()) ||
+		    (_json_doc["state"] | -1) != static_cast<int>(state)) {
+			ERROR("Temporary message-state payload failed validation");
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		if (!Utilities::OS::rename_file(message_path.c_str(), backup_path.c_str())) {
+			ERROR("Failed to preserve previous message-state payload");
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		if (!Utilities::OS::rename_file(temp_path.c_str(), message_path.c_str())) {
+			ERROR("Failed to commit message-state payload");
+			Utilities::OS::rename_file(backup_path.c_str(), message_path.c_str());
+			Utilities::OS::remove_file(temp_path.c_str());
+			return false;
+		}
+		Utilities::OS::remove_file(backup_path.c_str());
 
 		INFO("Message state updated to " + std::to_string(static_cast<int>(state)));
 		return true;
@@ -744,30 +1190,8 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 
 	INFO("Deleting message: " + message_hash.toHex());
 
-	// Remove message file from BOTH hot and archive — the file might
-	// be in either tier (or even both, briefly, if a previous archive
-	// op got past the write but failed the hot delete).
-	std::string message_path = get_message_path(message_hash);
-	if (Utilities::OS::file_exists(message_path.c_str())) {
-		if (!Utilities::OS::remove_file(message_path.c_str())) {
-			ERROR("Failed to delete message file: " + message_path);
-			return false;
-		}
-	}
-	if (_archive_fs) {
-		std::string arch_path = get_archive_message_path(message_hash);
-		if (_archive_fs.exists(arch_path.c_str())) {
-			if (!_archive_fs.remove(arch_path.c_str())) {
-				WARNING("Failed to delete archived message file: " + arch_path);
-				// Hot copy already gone; logical state is "deleted"
-				// even if the archive blob lingers. Don't fail the
-				// caller — better to leave a dangling file than to
-				// abort a delete that the user explicitly asked for.
-			}
-		}
-	}
-
 	// Update conversation index - remove from all conversations
+	ConversationInfo* changed_conversation = nullptr;
 	for (size_t i = 0; i < MAX_CONVERSATIONS; ++i) {
 		ConversationSlot& slot = _conversations_pool[i];
 		if (!slot.in_use) {
@@ -775,7 +1199,13 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 		}
 
 		ConversationInfo& conv = slot.info;
-		if (conv.remove_message_hash(message_hash)) {
+		if (conv.has_message(message_hash)) {
+			_transaction_snapshot = conv;
+			if (!conv.remove_message_hash(message_hash)) {
+				ERROR("Failed to remove message from in-memory conversation");
+				return false;
+			}
+			changed_conversation = &conv;
 			// Update last message if this was it
 			if (conv.last_message_hash_bytes() == message_hash) {
 				if (conv.message_count > 0) {
@@ -790,7 +1220,28 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 		}
 	}
 
-	save_index();
+	// Commit the logical deletion before removing payloads. If this fails,
+	// retain both the old in-memory index and all message data.
+	if (changed_conversation && !save_index()) {
+		*changed_conversation = _transaction_snapshot;
+		ERROR("Message deletion index commit failed");
+		return false;
+	}
+
+	// The durable index no longer references this message. Payload cleanup is
+	// now best-effort: a lingering blob is harmless, while deleting it before
+	// the index commit would create a stale entry after reboot.
+	std::string message_path = get_message_path(message_hash);
+	if (Utilities::OS::file_exists(message_path.c_str()) &&
+	    !Utilities::OS::remove_file(message_path.c_str())) {
+		WARNING("Failed to remove unreferenced message file: " + message_path);
+	}
+	if (_archive_fs) {
+		std::string arch_path = get_archive_message_path(message_hash);
+		if (_archive_fs.exists(arch_path.c_str()) && !_archive_fs.remove(arch_path.c_str())) {
+			WARNING("Failed to remove unreferenced archived message file: " + arch_path);
+		}
+	}
 	INFO("Message deleted");
 	return true;
 }
@@ -860,25 +1311,37 @@ bool MessageStore::delete_conversation(const Bytes& peer_hash) {
 	}
 
 	INFO("Deleting conversation: " + peer_hash.toHex());
+	_transaction_snapshot = slot->info;
 
-	// Delete all message files from BOTH hot and archive.
-	for (size_t i = 0; i < slot->info.message_count; ++i) {
-		Bytes msg_hash = slot->info.message_hash_bytes(i);
+	// Commit the logical deletion first. Restore the in-memory slot when the
+	// transactional index write fails, leaving every payload intact.
+	slot->clear();
+	if (!save_index()) {
+		slot->in_use = true;
+		slot->set_peer_hash(peer_hash);
+		slot->info = _transaction_snapshot;
+		ERROR("Conversation deletion index commit failed");
+		return false;
+	}
+
+	// Delete all now-unreferenced message files from BOTH hot and archive.
+	for (size_t i = 0; i < _transaction_snapshot.message_count; ++i) {
+		Bytes msg_hash = _transaction_snapshot.message_hash_bytes(i);
 		std::string message_path = get_message_path(msg_hash);
 		if (Utilities::OS::file_exists(message_path.c_str())) {
-			Utilities::OS::remove_file(message_path.c_str());
+			if (!Utilities::OS::remove_file(message_path.c_str())) {
+				WARNING("Failed to remove unreferenced message file: " + message_path);
+			}
 		}
 		if (_archive_fs) {
 			std::string arch_path = get_archive_message_path(msg_hash);
 			if (_archive_fs.exists(arch_path.c_str())) {
-				_archive_fs.remove(arch_path.c_str());
+				if (!_archive_fs.remove(arch_path.c_str())) {
+					WARNING("Failed to remove unreferenced archived message file: " + arch_path);
+				}
 			}
 		}
 	}
-
-	// Clear slot and mark as not in use
-	slot->clear();
-	save_index();
 
 	INFO("Conversation deleted");
 	return true;
@@ -915,7 +1378,15 @@ size_t MessageStore::get_unread_count() const {
 bool MessageStore::clear_all() {
 	INFO("Clearing all message store data");
 
-	// Delete all message files
+	// Persist the empty index without first destroying the in-memory index.
+	// This leaves all state recoverable when the transaction fails and lets us
+	// enumerate payloads only after the logical clear is durable.
+	if (!save_index(true)) {
+		ERROR("Message store clear index commit failed");
+		return false;
+	}
+
+	// Delete all now-unreferenced message files.
 	for (size_t i = 0; i < MAX_CONVERSATIONS; ++i) {
 		ConversationSlot& slot = _conversations_pool[i];
 		if (!slot.in_use) {
@@ -924,14 +1395,19 @@ bool MessageStore::clear_all() {
 		for (size_t j = 0; j < slot.info.message_count; ++j) {
 			std::string message_path = get_message_path(slot.info.message_hash_bytes(j));
 			if (Utilities::OS::file_exists(message_path.c_str())) {
-				Utilities::OS::remove_file(message_path.c_str());
+				if (!Utilities::OS::remove_file(message_path.c_str())) {
+					WARNING("Failed to remove unreferenced message file: " + message_path);
+				}
+			}
+			if (_archive_fs) {
+				std::string arch_path = get_archive_message_path(slot.info.message_hash_bytes(j));
+				if (_archive_fs.exists(arch_path.c_str()) && !_archive_fs.remove(arch_path.c_str())) {
+					WARNING("Failed to remove unreferenced archived message file: " + arch_path);
+				}
 			}
 		}
 		slot.clear();
 	}
-
-	// Save empty index
-	save_index();
 
 	INFO("Message store cleared");
 	return true;

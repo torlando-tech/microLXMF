@@ -1,6 +1,7 @@
 .pio/
 build/
 conformance-bridge/build/
+conformance-bridge/build-*/
 *.o
 *.a
 *.so

@@ -1,6 +1,6 @@
 #include "PropagationNodeManager.h"
-#include <Log.h>
-#include <Utilities/OS.h>
+#include <microReticulum/Log.h>
+#include <microReticulum/Utilities/OS.h>
 
 #include <MsgPack.h>
 #include <algorithm>

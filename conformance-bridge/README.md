@@ -22,9 +22,10 @@ JSON-RPC stdio bridge for [lxmf-conformance](https://github.com/torlando-tech/lx
 ```bash
 cd ~/repos/microLXMF/conformance-bridge
 cmake -S . -B build
-cmake --build build --target microLXMFBridge
+cmake --build build --target microLXMFBridge test_messagestore_tiers check_messagestore_stack
 ./build/microLXMFBridge
 # READY → accepts JSON-RPC commands on stdin
+./build/test_messagestore_tiers
 ```
 
 ```bash
@@ -86,11 +87,11 @@ The conformance harness drove out 7 substantive bugs in microReticulum, microLXM
 |---|---|---|
 | JSON-RPC dispatch | `src/main.cpp`, `src/bridge.{h,cpp}` | Same shape as reticulum-conformance microreticulum bridge |
 | Command handlers | `src/commands/lxmf.cpp` | 14 commands incl. `ping`, `lxmf_init`, `lxmf_send_*`, `lxmf_request_path`, `lxmf_has_path`, `lxmf_set_outbound_propagation_node` |
-| Runtime state | `src/runtime/Runtime.{h,cpp}` | Singleton owning Reticulum + LXMRouter + worker thread |
+| Runtime state | `src/runtime/Runtime.{h,cpp}` | Singleton owning Reticulum, MessageStore, LXMRouter and worker thread; outbound commands persist before routing |
 | TCP transport | `src/runtime/PosixTCPInterface.{h,cpp}` + `HDLC.h` | Single-peer (accept-one) server + client modes |
 | microLXMF | `../src/LXMF/` | Linked as static lib `MicroLXMFLib` |
-| microReticulum | `torlando-tech/microReticulum:pyxis-fixes-on-0.3.0` via FetchContent | 4 PR-ready Cryptography + 1 link-proof fix |
-| microStore | `attermann/microStore:master` | `USTORE_USE_POSIXFS` selects host backend |
+| microReticulum | Firmware-matched commit via FetchContent | Same 0.4.1 header and transport layout as Pyxis |
+| microStore | Transitive from microReticulum | Universal filesystem selects POSIX on x86 |
 | MsgPack stack | `hideakitai/MsgPack@v0.4.2` + ArxContainer + ArxTypeTraits + DebugLog | Header-only |
 | ArduinoJson | `bblanchon/ArduinoJson:v7.4.2` | LXMF MessageStore JSON-on-disk |
 | attermann/Crypto | pinned commit | SHA / HMAC / AES / X25519 / Ed25519 |

@@ -1,10 +1,10 @@
 #pragma once
 
 #include "Type.h"
-#include <Bytes.h>
-#include <Identity.h>
-#include <Destination.h>
-#include <Link.h>
+#include <microReticulum/Bytes.h>
+#include <microReticulum/Identity.h>
+#include <microReticulum/Destination.h>
+#include <microReticulum/Link.h>
 
 #include <string>
 #include <memory>

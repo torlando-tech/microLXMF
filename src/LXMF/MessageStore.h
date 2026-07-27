@@ -1,7 +1,7 @@
 #pragma once
 
 #include "LXMessage.h"
-#include <Bytes.h>
+#include <microReticulum/Bytes.h>
 
 #include <ArduinoJson.h>
 #include <microStore/FileSystem.h>
@@ -371,7 +371,8 @@ namespace LXMF {
 		 *
 		 * Loads conversations.json into _conversations_pool.
 		 */
-		void load_index();
+		bool load_index();
+		bool load_index_file(const std::string& index_path);
 
 		/**
 		 * @brief Save conversation index to disk
@@ -380,7 +381,7 @@ namespace LXMF {
 		 *
 		 * @return True if saved successfully
 		 */
-		bool save_index();
+		bool save_index(bool empty = false);
 
 		/**
 		 * @brief Get filesystem path for a message file
@@ -389,6 +390,9 @@ namespace LXMF {
 		 * @return Full path to message JSON file
 		 */
 		std::string get_message_path(const RNS::Bytes& message_hash) const;
+		bool recover_message_payload(const std::string& message_path,
+		                             const RNS::Bytes& expected_hash);
+		bool recover_archived_message_payload(const RNS::Bytes& expected_hash);
 
 		/**
 		 * @brief Get filesystem path for conversation directory
@@ -436,21 +440,6 @@ namespace LXMF {
 
 	private:
 		/**
-		 * @brief Evict the OLDEST message from a conversation, freeing
-		 *        storage in both hot (if present) and archive (if present)
-		 *        and removing it from the in-memory hash list.
-		 *
-		 * Called when add_message_hash hits MAX_MESSAGES_PER_CONVERSATION.
-		 * Without this, the hard cap would silently start dropping NEW
-		 * messages once a conversation was full — instead we drop the
-		 * oldest (which is presumably already archived and rarely touched)
-		 * and let new messages flow in.
-		 *
-		 * @return True if eviction freed a slot, false otherwise.
-		 */
-		bool evict_oldest_message(ConversationInfo& conv);
-
-		/**
 		 * @brief Cull-walk a conversation, archiving messages older than
 		 *        HOT_MESSAGES_PER_CONVERSATION.
 		 *
@@ -467,6 +456,8 @@ namespace LXMF {
 		 *         is removed iff archive succeeded (or no archive_fs).
 		 */
 		bool archive_one_message(const RNS::Bytes& message_hash);
+		bool update_archived_message_state(const RNS::Bytes& message_hash,
+		                                   Type::Message::State state);
 
 		/**
 		 * @brief Build the archive-side path for a message hash.
@@ -503,6 +494,13 @@ namespace LXMF {
 		// Note: This class is assumed to be used from a single thread (main loop).
 		// If called from multiple threads, this would need per-thread documents or locking.
 		JsonDocument _json_doc;
+
+		// Reusable rollback snapshot for save_message(). ConversationInfo is
+		// larger than 8 KiB, so placing it in the save_message stack frame
+		// overflows callers such as Pyxis's LVGL task. MessageStore already has
+		// a single-threaded contract because _json_doc is shared, so reuse one
+		// object-owned snapshot instead of allocating or copying it on the stack.
+		ConversationInfo _transaction_snapshot;
 	};
 
 }  // namespace LXMF

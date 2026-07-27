@@ -2,11 +2,11 @@
 
 #include "Type.h"
 #include "LXMessage.h"
-#include <Bytes.h>
-#include <Identity.h>
-#include <Destination.h>
-#include <Link.h>
-#include <Packet.h>
+#include <microReticulum/Bytes.h>
+#include <microReticulum/Identity.h>
+#include <microReticulum/Destination.h>
+#include <microReticulum/Link.h>
+#include <microReticulum/Packet.h>
 
 #include <vector>
 #include <string>
