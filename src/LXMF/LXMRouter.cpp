@@ -10,6 +10,149 @@
 using namespace LXMF;
 using namespace RNS;
 
+namespace {
+
+class DeliveryAnnounceHandler final : public AnnounceHandler {
+public:
+	explicit DeliveryAnnounceHandler(LXMRouter* router) :
+		AnnounceHandler("lxmf.delivery"), _router(router) {}
+
+	void received_announce(const Bytes& destination_hash,
+	                       const Identity&,
+	                       const Bytes& app_data) override {
+		if (_router) _router->on_delivery_announce(destination_hash, app_data);
+	}
+
+private:
+	LXMRouter* _router;
+};
+
+// LXMF 0.5+ delivery announce app_data is a MessagePack array whose second
+// element is the requested inbound stamp cost (integer or nil). Only the
+// protocol-defined display-name forms (binary, string, or nil) and integer
+// cost forms are accepted; bounds are checked before every read.
+bool decode_announce_stamp_cost(const Bytes& app_data, uint8_t& cost, bool& has_cost) {
+	if (!app_data) return false;
+	const uint8_t* data = app_data.data();
+	const size_t size = app_data.size();
+	size_t offset = 0;
+
+	auto read_u16 = [&data, &size](size_t& pos, uint16_t& value) -> bool {
+		if (pos + 2 > size) return false;
+		value = static_cast<uint16_t>((static_cast<uint16_t>(data[pos]) << 8) | data[pos + 1]);
+		pos += 2;
+		return true;
+	};
+	auto read_u32 = [&data, &size](size_t& pos, uint32_t& value) -> bool {
+		if (pos + 4 > size) return false;
+		value = (static_cast<uint32_t>(data[pos]) << 24) |
+		        (static_cast<uint32_t>(data[pos + 1]) << 16) |
+		        (static_cast<uint32_t>(data[pos + 2]) << 8) |
+		        static_cast<uint32_t>(data[pos + 3]);
+		pos += 4;
+		return true;
+	};
+	auto read_u64 = [&data, &size](size_t& pos, uint64_t& value) -> bool {
+		if (pos + 8 > size) return false;
+		value = 0;
+		for (size_t i = 0; i < 8; ++i) {
+			value = (value << 8) | data[pos + i];
+		}
+		pos += 8;
+		return true;
+	};
+
+	uint32_t array_size = 0;
+	const uint8_t array_tag = data[offset++];
+	if ((array_tag & 0xf0) == 0x90) {
+		array_size = array_tag & 0x0f;
+	} else if (array_tag == 0xdc) {
+		uint16_t value = 0;
+		if (!read_u16(offset, value)) return false;
+		array_size = value;
+	} else if (array_tag == 0xdd) {
+		if (!read_u32(offset, array_size)) return false;
+	} else {
+		return false;
+	}
+	if (array_size < 2 || offset >= size) return false;
+
+	// Skip the display-name element without deserialising or allocating it.
+	const uint8_t name_tag = data[offset++];
+	uint32_t name_length = 0;
+	if (name_tag == 0xc0) {
+		name_length = 0;
+	} else if ((name_tag & 0xe0) == 0xa0) {
+		name_length = name_tag & 0x1f;
+	} else if (name_tag == 0xc4 || name_tag == 0xd9) {
+		if (offset >= size) return false;
+		name_length = data[offset++];
+	} else if (name_tag == 0xc5 || name_tag == 0xda) {
+		uint16_t value = 0;
+		if (!read_u16(offset, value)) return false;
+		name_length = value;
+	} else if (name_tag == 0xc6 || name_tag == 0xdb) {
+		if (!read_u32(offset, name_length)) return false;
+	} else {
+		return false;
+	}
+	if (name_length > size - offset) return false;
+	offset += name_length;
+	if (offset >= size) return false;
+
+	const uint8_t cost_tag = data[offset++];
+	uint32_t parsed_cost = 0;
+	if (cost_tag == 0xc0) {
+		cost = 0;
+		has_cost = false;
+		return true;
+	} else if (cost_tag <= 0x7f) {
+		parsed_cost = cost_tag;
+	} else if (cost_tag == 0xcc) {
+		if (offset >= size) return false;
+		parsed_cost = data[offset];
+	} else if (cost_tag == 0xcd) {
+		uint16_t value = 0;
+		if (!read_u16(offset, value)) return false;
+		parsed_cost = value;
+	} else if (cost_tag == 0xce) {
+		if (!read_u32(offset, parsed_cost)) return false;
+	} else if (cost_tag == 0xcf) {
+		uint64_t value = 0;
+		if (!read_u64(offset, value) || value > 254) return false;
+		parsed_cost = static_cast<uint32_t>(value);
+	} else if (cost_tag == 0xd0) {
+		if (offset >= size) return false;
+		const uint8_t encoded = data[offset];
+		if ((encoded & 0x80) != 0) return false;
+		parsed_cost = encoded;
+	} else if (cost_tag == 0xd1) {
+		uint16_t encoded = 0;
+		if (!read_u16(offset, encoded)) return false;
+		if ((encoded & 0x8000) != 0) return false;
+		parsed_cost = encoded;
+	} else if (cost_tag == 0xd2) {
+		uint32_t encoded = 0;
+		if (!read_u32(offset, encoded)) return false;
+		if ((encoded & 0x80000000U) != 0) return false;
+		parsed_cost = encoded;
+	} else if (cost_tag == 0xd3) {
+		uint64_t encoded = 0;
+		if (!read_u64(offset, encoded)) return false;
+		if ((encoded & 0x8000000000000000ULL) != 0 || encoded > 254) return false;
+		parsed_cost = static_cast<uint32_t>(encoded);
+	} else {
+		return false;
+	}
+
+	if (parsed_cost < 1 || parsed_cost > 254) return false;
+	cost = static_cast<uint8_t>(parsed_cost);
+	has_cost = true;
+	return true;
+}
+
+} // namespace
+
 // ============== Static Fixed Pool Definitions ==============
 
 // Router registry fixed pool (zero heap fragmentation)
@@ -440,6 +583,11 @@ LXMRouter::LXMRouter(
 	// Register link established callback for incoming links (DIRECT delivery)
 	_delivery_destination.set_link_established_callback(static_delivery_link_established_callback);
 
+	// Learn remote stamp requirements from lxmf.delivery announces before
+	// packing outbound messages, matching the Python LXMF router.
+	_delivery_announce_handler = std::make_shared<DeliveryAnnounceHandler>(this);
+	Transport::register_announce_handler(_delivery_announce_handler);
+
 	char buf[128];
 	snprintf(buf, sizeof(buf), "  Delivery destination: %s", _delivery_destination.hash().toHex().c_str());
 	INFO(buf);
@@ -459,6 +607,11 @@ LXMRouter::LXMRouter(
 }
 
 LXMRouter::~LXMRouter() {
+	if (_delivery_announce_handler) {
+		Transport::deregister_announce_handler(_delivery_announce_handler);
+		_delivery_announce_handler.reset();
+	}
+
 	// Unregister from global registry
 	RouterRegistrySlot* slot = find_router_registry_slot(_delivery_destination.hash());
 	if (slot) {
@@ -585,7 +738,31 @@ void LXMRouter::handle_outbound(LXMessage& message) {
 	snprintf(buf, sizeof(buf), "  Content size: %zu bytes", message.content().size());
 	DEBUG(buf);
 
-	// Pack the message
+	// Apply the latest cost advertised by the destination unless the caller
+	// already requested a stamp explicitly. Generate before queueing so a
+	// required-stamp failure cannot be reported as a successful send.
+	bool generate_auto_stamp = false;
+	if (message.stamp_cost() == 0) {
+		const uint8_t announced_cost = get_outbound_stamp_cost(message.destination_hash());
+		if (announced_cost > MAX_AUTO_OUTBOUND_STAMP_COST) {
+			throw std::runtime_error("Peer-advertised stamp cost exceeds local automatic generation limit");
+		}
+		if (announced_cost > 0) {
+			message.set_stamp_cost(announced_cost);
+			generate_auto_stamp = true;
+			DEBUG("  Auto-configured stamp cost " + std::to_string(announced_cost) +
+			      " from latest delivery announce");
+		}
+	}
+
+	if (generate_auto_stamp && !message.has_valid_stamp()) {
+		message.pack();
+		if (!message.generate_stamp()) {
+			throw std::runtime_error("Failed to generate required LXMF stamp");
+		}
+	}
+
+	// Pack the message (or repack after stamp generation).
 	message.pack();
 
 	// Check if message fits in a single LoRa packet - use OPPORTUNISTIC if so
@@ -604,6 +781,53 @@ void LXMRouter::handle_outbound(LXMessage& message) {
 
 	snprintf(buf, sizeof(buf), "Message queued for delivery (%zu pending)", _pending_outbound_count);
 	INFO(buf);
+}
+
+void LXMRouter::update_stamp_cost(const Bytes& destination_hash, uint8_t cost) {
+	if (destination_hash.size() != DEST_HASH_SIZE) {
+		WARNING("Ignoring stamp cost for invalid destination hash length");
+		return;
+	}
+
+	for (size_t i = 0; i < OUTBOUND_STAMP_COSTS_SIZE; ++i) {
+		auto& slot = _outbound_stamp_costs[i];
+		if (!slot.in_use || !slot.destination_hash_equals(destination_hash)) continue;
+		if (cost == 0) slot.clear();
+		else slot.cost = cost;
+		return;
+	}
+
+	if (cost == 0) return;
+
+	// Reuse holes left by nil announces before evicting a live peer.
+	for (size_t i = 0; i < OUTBOUND_STAMP_COSTS_SIZE; ++i) {
+		if (_outbound_stamp_costs[i].in_use) continue;
+		_outbound_stamp_costs[i].set(destination_hash, cost);
+		return;
+	}
+
+	auto& slot = _outbound_stamp_costs[_outbound_stamp_costs_next];
+	slot.set(destination_hash, cost);
+	_outbound_stamp_costs_next = (_outbound_stamp_costs_next + 1) % OUTBOUND_STAMP_COSTS_SIZE;
+}
+
+uint8_t LXMRouter::get_outbound_stamp_cost(const Bytes& destination_hash) const {
+	for (size_t i = 0; i < OUTBOUND_STAMP_COSTS_SIZE; ++i) {
+		const auto& slot = _outbound_stamp_costs[i];
+		if (slot.in_use && slot.destination_hash_equals(destination_hash)) return slot.cost;
+	}
+	return 0;
+}
+
+void LXMRouter::on_delivery_announce(const Bytes& destination_hash, const Bytes& app_data) {
+	uint8_t cost = 0;
+	bool has_cost = false;
+	if (!decode_announce_stamp_cost(app_data, cost, has_cost)) {
+		DEBUG("Could not decode stamp cost from lxmf.delivery announce");
+		return;
+	}
+
+	update_stamp_cost(destination_hash, has_cost ? cost : 0);
 }
 
 // Process outbound queue

@@ -13,6 +13,10 @@
 #include <functional>
 #include <memory>
 
+namespace RNS {
+	class AnnounceHandler;
+}
+
 namespace LXMF {
 
 	/**
@@ -174,6 +178,15 @@ namespace LXMF {
 		 * @param message Message to send
 		 */
 		void handle_outbound(LXMessage& message);
+
+		/** Update the stamp cost advertised by a remote delivery destination. */
+		void update_stamp_cost(const RNS::Bytes& destination_hash, uint8_t cost);
+
+		/** Return the latest advertised stamp cost, or zero when none is cached. */
+		uint8_t get_outbound_stamp_cost(const RNS::Bytes& destination_hash) const;
+
+		/** Process app data received by the lxmf.delivery announce adapter. */
+		void on_delivery_announce(const RNS::Bytes& destination_hash, const RNS::Bytes& app_data);
 
 		/**
 		 * @brief Process outbound message queue
@@ -668,6 +681,35 @@ namespace LXMF {
 		bool _announce_at_start = true;            // Announce on startup
 		double _last_announce_time = 0.0;          // Last announce timestamp
 		std::string _display_name;                 // Display name for announces
+		std::shared_ptr<RNS::AnnounceHandler> _delivery_announce_handler;
+
+		// Latest remote delivery stamp requirements. A fixed FIFO avoids an
+		// unbounded peer-controlled map on embedded targets.
+		static constexpr size_t OUTBOUND_STAMP_COSTS_SIZE = 32;
+		// Bound synchronous work triggered by a peer-controlled announce.
+		static constexpr uint8_t MAX_AUTO_OUTBOUND_STAMP_COST = 16;
+		struct OutboundStampCostSlot {
+			bool in_use = false;
+			uint8_t destination_hash[DEST_HASH_SIZE] = {};
+			uint8_t cost = 0;
+
+			bool destination_hash_equals(const RNS::Bytes& hash) const {
+				return hash.size() == DEST_HASH_SIZE &&
+				       memcmp(destination_hash, hash.data(), DEST_HASH_SIZE) == 0;
+			}
+			void set(const RNS::Bytes& hash, uint8_t new_cost) {
+				memcpy(destination_hash, hash.data(), DEST_HASH_SIZE);
+				cost = new_cost;
+				in_use = true;
+			}
+			void clear() {
+				in_use = false;
+				memset(destination_hash, 0, DEST_HASH_SIZE);
+				cost = 0;
+			}
+		};
+		OutboundStampCostSlot _outbound_stamp_costs[OUTBOUND_STAMP_COSTS_SIZE];
+		size_t _outbound_stamp_costs_next = 0;
 
 		// Internal state
 		bool _initialized = false;
