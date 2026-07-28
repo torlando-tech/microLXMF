@@ -1203,14 +1203,11 @@ void LXMRouter::retry_failed_outbound() {
 
 	// Move all failed messages back to pending
 	LXMessage message;
-	while (failed_outbound_pop(message)) {
+	while (_pending_outbound_count < PENDING_OUTBOUND_SIZE &&
+	       failed_outbound_pop(message)) {
 		message.state(Type::Message::OUTBOUND);
-		if (!pending_outbound_push(message)) {
-			// The pop created one failed-queue slot. Preserve this message for a
-			// later retry rather than losing previously accepted work.
-			failed_outbound_push(message);
-			break;
-		}
+		const bool queued = pending_outbound_push(message);
+		assert(queued);
 	}
 }
 

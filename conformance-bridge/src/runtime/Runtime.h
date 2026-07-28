@@ -168,6 +168,8 @@ private:
     // LXMF router. shared_ptr because LXMRouter::Ptr exists for
     // co-ownership patterns.
     std::shared_ptr<LXMF::LXMRouter> _router;
+    // Serializes bridge request-thread and worker-thread router operations.
+    std::mutex _router_mutex;
     std::unique_ptr<LXMF::MessageStore> _message_store;
     std::mutex _message_store_mutex;
 

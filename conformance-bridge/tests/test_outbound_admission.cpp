@@ -33,6 +33,7 @@ Destination remoteDestination(uint8_t seed) {
 void fullQueueRejectsWithoutEvictionOrMessageMutation() {
     LXMRouter router(Identity(), "", false);
     Destination remote = remoteDestination(7);
+    assert(router.outbound_queue_has_capacity());
 
     LXMessage guard_rejected(remote, router.delivery_destination(),
                              Bytes("guard-rejected"));
@@ -59,6 +60,7 @@ void fullQueueRejectsWithoutEvictionOrMessageMutation() {
 
     assert(accepted > 0U);
     const std::size_t full_count = router.pending_outbound_count();
+    assert(!router.outbound_queue_has_capacity());
     LXMessage rejected(remote, router.delivery_destination(), Bytes("rejected"));
     assert(router.try_handle_outbound(rejected) ==
            OutboundAdmissionResult::QUEUE_FULL);

@@ -284,6 +284,9 @@ namespace LXMF {
 		 * @return Number of messages waiting to be sent
 		 */
 		inline size_t pending_outbound_count() const { return _pending_outbound_count; }
+		inline bool outbound_queue_has_capacity() const {
+			return _pending_outbound_count < PENDING_OUTBOUND_SIZE;
+		}
 
 		/**
 		 * @brief Get pending inbound message count
