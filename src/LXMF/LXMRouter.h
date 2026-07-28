@@ -19,6 +19,13 @@ namespace RNS {
 
 namespace LXMF {
 
+	enum class OutboundAdmissionResult : uint8_t {
+		ACCEPTED,
+		QUEUE_FULL,
+		GUARD_REJECTED,
+	};
+	using OutboundAdmissionGuard = bool (*)(void* context);
+
 	/**
 	 * @brief LXMF Router - Message delivery orchestration
 	 *
@@ -178,6 +185,21 @@ namespace LXMF {
 		 * @param message Message to send
 		 */
 		void handle_outbound(LXMessage& message);
+
+		/**
+		 * @brief Try to queue without evicting previously accepted work.
+		 *
+		 * ACCEPTED means the router synchronously copied the complete message.
+		 * QUEUE_FULL leaves the caller's message and queue unchanged. Router
+		 * operations must be externally serialized. Packing and stamp failures
+		 * continue to throw before admission. An optional guard runs immediately
+		 * before the ownership copy; GUARD_REJECTED queues nothing, but packing or
+		 * stamp preparation may already have mutated the caller's message.
+		 */
+		OutboundAdmissionResult try_handle_outbound(
+			LXMessage& message,
+			OutboundAdmissionGuard guard = nullptr,
+			void* guard_context = nullptr);
 
 		/** Update the stamp cost advertised by a remote delivery destination. */
 		void update_stamp_cost(const RNS::Bytes& destination_hash, uint8_t cost);

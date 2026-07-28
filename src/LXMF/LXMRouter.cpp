@@ -624,11 +624,8 @@ LXMRouter::~LXMRouter() {
 
 bool LXMRouter::pending_outbound_push(const LXMessage& msg) {
 	if (_pending_outbound_count >= PENDING_OUTBOUND_SIZE) {
-		WARNING("Pending outbound queue full, dropping oldest message");
-		// Advance tail to drop oldest
-		_pending_outbound_pool[_pending_outbound_tail] = LXMessage();  // Clear slot
-		_pending_outbound_tail = (_pending_outbound_tail + 1) % PENDING_OUTBOUND_SIZE;
-		_pending_outbound_count--;
+		WARNING("Pending outbound queue full, rejecting new message");
+		return false;
 	}
 	_pending_outbound_pool[_pending_outbound_head] = msg;
 	_pending_outbound_head = (_pending_outbound_head + 1) % PENDING_OUTBOUND_SIZE;
@@ -731,6 +728,19 @@ void LXMRouter::register_progress_callback(ProgressCallback callback) {
 
 // Queue outbound message
 void LXMRouter::handle_outbound(LXMessage& message) {
+	if (try_handle_outbound(message) == OutboundAdmissionResult::QUEUE_FULL) {
+		WARNING("Outbound message rejected because pending queue is full");
+	}
+}
+
+OutboundAdmissionResult LXMRouter::try_handle_outbound(
+	LXMessage& message,
+	OutboundAdmissionGuard guard,
+	void* guard_context) {
+	// Reject before packing, stamping or mutating the caller's message.
+	if (_pending_outbound_count >= PENDING_OUTBOUND_SIZE) {
+		return OutboundAdmissionResult::QUEUE_FULL;
+	}
 	INFO("Handling outbound LXMF message");
 	char buf[128];
 	snprintf(buf, sizeof(buf), "  Destination: %s", message.destination_hash().toHex().c_str());
@@ -773,14 +783,23 @@ void LXMRouter::handle_outbound(LXMessage& message) {
 		INFO("  Message too large for single LoRa packet, will use DIRECT (link) delivery");
 	}
 
+	// The caller can enforce an external lease immediately before ownership
+	// transfer, after all potentially expensive packing and stamp work.
+	if (guard != nullptr && !guard(guard_context)) {
+		return OutboundAdmissionResult::GUARD_REJECTED;
+	}
+
 	// Set state to outbound
 	message.state(Type::Message::OUTBOUND);
 
 	// Add to pending queue
-	pending_outbound_push(message);
+	if (!pending_outbound_push(message)) {
+		return OutboundAdmissionResult::QUEUE_FULL;
+	}
 
 	snprintf(buf, sizeof(buf), "Message queued for delivery (%zu pending)", _pending_outbound_count);
 	INFO(buf);
+	return OutboundAdmissionResult::ACCEPTED;
 }
 
 void LXMRouter::update_stamp_cost(const Bytes& destination_hash, uint8_t cost) {
@@ -1186,7 +1205,12 @@ void LXMRouter::retry_failed_outbound() {
 	LXMessage message;
 	while (failed_outbound_pop(message)) {
 		message.state(Type::Message::OUTBOUND);
-		pending_outbound_push(message);
+		if (!pending_outbound_push(message)) {
+			// The pop created one failed-queue slot. Preserve this message for a
+			// later retry rather than losing previously accepted work.
+			failed_outbound_push(message);
+			break;
+		}
 	}
 }
 

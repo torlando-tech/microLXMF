@@ -304,3 +304,18 @@ target_compile_definitions(test_announced_stamp_cost PRIVATE
     MICROLXMF_NATIVE=1
     NATIVE=1
 )
+
+# Host-side regression coverage for explicit, non-evicting outbound queue
+# admission. A full queue must reject the new message without mutating it or
+# discarding previously accepted work.
+add_executable(test_outbound_admission tests/test_outbound_admission.cpp)
+target_include_directories(test_outbound_admission PRIVATE src)
+target_link_libraries(test_outbound_admission PRIVATE MicroLXMFLib Threads::Threads)
+target_compile_options(test_outbound_admission PRIVATE
+    -fexceptions
+    -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+)
+target_compile_definitions(test_outbound_admission PRIVATE
+    MICROLXMF_NATIVE=1
+    NATIVE=1
+)
