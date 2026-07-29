@@ -216,6 +216,9 @@ void Runtime::worker_loop() {
             // pass against bridge-thread router operations, not only the
             // explicit process_* calls below.
             std::lock_guard<std::mutex> router_guard(_router_mutex);
+            for (const auto& interface : _interfaces) {
+                if (interface) interface->drain_incoming();
+            }
             if (_reticulum) {
                 _reticulum->loop();
                 _reticulum->jobs();
@@ -225,6 +228,7 @@ void Runtime::worker_loop() {
                 _router->process_inbound();
                 if (_sync_request_pending.exchange(false)) {
                     _router->request_messages_from_propagation_node();
+                    _sync_request_started.store(true);
                 }
                 _router->process_sync();
             }
@@ -236,7 +240,9 @@ void Runtime::worker_loop() {
 }
 
 int Runtime::add_tcp_server_interface(const std::string& name, int port) {
+    std::lock_guard<std::mutex> lifecycle_guard(_lifecycle_mutex);
     if (!_initialized.load()) throw std::runtime_error("Runtime not initialized");
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     auto impl = std::make_shared<PosixTCPInterface>(
         name.c_str(), PosixTCPInterface::SERVER);
     impl->set_bind("127.0.0.1", port);
@@ -244,11 +250,10 @@ int Runtime::add_tcp_server_interface(const std::string& name, int port) {
         throw std::runtime_error("PosixTCPInterface(SERVER): start failed");
     }
     int bound = impl->bound_port();
-    // Register as RNS interface. Interface(InterfaceImpl*) takes
-    // ownership via shared_ptr — but our impl is already in a shared_ptr,
-    // so we hand a raw aliased pointer over and Interface's shared_ptr
-    // will reference the same control block.
-    auto handle = std::unique_ptr<Interface>(new Interface(impl.get()));
+    // Share the existing control block with the RNS handle. Passing impl.get()
+    // would create a second owning shared_ptr and double-delete the interface.
+    std::shared_ptr<InterfaceImpl> shared_impl = impl;
+    auto handle = std::unique_ptr<Interface>(new Interface(shared_impl));
     Transport::register_interface(*handle);
     _interfaces.push_back(impl);
     _iface_handles.push_back(std::move(handle));
@@ -257,14 +262,17 @@ int Runtime::add_tcp_server_interface(const std::string& name, int port) {
 
 void Runtime::add_tcp_client_interface(const std::string& name,
                                        const std::string& host, int port) {
+    std::lock_guard<std::mutex> lifecycle_guard(_lifecycle_mutex);
     if (!_initialized.load()) throw std::runtime_error("Runtime not initialized");
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     auto impl = std::make_shared<PosixTCPInterface>(
         name.c_str(), PosixTCPInterface::CLIENT);
     impl->set_target(host, port);
     if (!impl->start_iface()) {
         throw std::runtime_error("PosixTCPInterface(CLIENT): start failed");
     }
-    auto handle = std::unique_ptr<Interface>(new Interface(impl.get()));
+    std::shared_ptr<InterfaceImpl> shared_impl = impl;
+    auto handle = std::unique_ptr<Interface>(new Interface(shared_impl));
     Transport::register_interface(*handle);
     _interfaces.push_back(impl);
     _iface_handles.push_back(std::move(handle));
@@ -464,41 +472,69 @@ void Runtime::set_outbound_propagation_node(const Bytes& node_hash, uint8_t stam
 
 Runtime::SyncResult Runtime::sync_inbound(double timeout_sec) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
+    std::lock_guard<std::mutex> sync_call_guard(_sync_call_mutex);
 
-    // Latch the result via the sync-complete callback. The router fires
-    // the callback exactly once on PR_COMPLETE; failures just leave the
-    // state at PR_FAILED, which we observe by polling.
+    // Latch the result via the sync-complete callback. The callback captures
+    // stack state, so every exit path clears it while holding the same mutex
+    // used for callback dispatch.
     std::atomic<size_t> received{0};
     std::atomic<bool> completed{false};
+    bool attach_to_active_sync = false;
     {
         std::lock_guard<std::mutex> router_guard(_router_mutex);
+        const auto state = _router->get_sync_state();
+        attach_to_active_sync =
+            state != LXMF::LXMRouter::PR_IDLE &&
+            state != LXMF::LXMRouter::PR_COMPLETE &&
+            state != LXMF::LXMRouter::PR_FAILED;
         _router->register_sync_complete_callback(
             [&](size_t n) { received.store(n); completed.store(true); });
     }
 
-    // Defer the actual request to the worker thread — the LXMRouter
-    // sync state machine touches RNS Transport / Link state that must
-    // be mutated on the loop thread.
-    _sync_request_pending.store(true);
+    if (attach_to_active_sync) {
+        // A previous caller timed out while the global router sync continued.
+        // Observe that same operation instead of starting a second request and
+        // misattributing the first operation's completion.
+        _sync_request_started.store(true);
+    } else {
+        // Defer a new request to the worker thread. Ignore a previous terminal
+        // router state until the worker has actually started this request.
+        _sync_request_started.store(false);
+        _sync_request_pending.store(true);
+    }
+
+    auto finish = [&](const char* state, size_t count, bool terminal) {
+        std::lock_guard<std::mutex> router_guard(_router_mutex);
+        _router->register_sync_complete_callback({});
+        if (terminal) {
+            _sync_request_started.store(false);
+        }
+        return SyncResult{state, count};
+    };
 
     using namespace std::chrono;
     auto deadline = steady_clock::now() + duration_cast<steady_clock::duration>(
         duration<double>(timeout_sec));
     while (steady_clock::now() < deadline) {
-        LXMF::LXMRouter::PropagationSyncState st;
+        LXMF::LXMRouter::PropagationSyncState state;
         {
             std::lock_guard<std::mutex> router_guard(_router_mutex);
-            st = _router->get_sync_state();
+            state = _router->get_sync_state();
         }
-        if (completed.load() || st == LXMF::LXMRouter::PR_COMPLETE) {
-            return {"complete", received.load()};
+        if (completed.load()) {
+            return finish("complete", received.load(), true);
         }
-        if (st == LXMF::LXMRouter::PR_FAILED) {
-            return {"failed", 0};
+        if (_sync_request_started.load()) {
+            if (state == LXMF::LXMRouter::PR_COMPLETE) {
+                return finish("complete", received.load(), true);
+            }
+            if (state == LXMF::LXMRouter::PR_FAILED) {
+                return finish("failed", 0, true);
+            }
         }
         std::this_thread::sleep_for(milliseconds(50));
     }
-    return {"timeout", received.load()};
+    return finish("timeout", received.load(), false);
 }
 
 std::vector<Runtime::ReceivedMsg> Runtime::get_received_messages(

@@ -10,6 +10,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -97,11 +98,33 @@ void acceptedOwnershipIsDurableAndUsesFinalHash() {
     assert(outbound_states.at(hash) == LXMF::Type::Message::OUTBOUND);
 }
 
+void liveInterfaceRegistrationAndSyncTimeoutAreSafe() {
+    char path_template[64] = "/tmp/microlxmf-runtime-live-XXXXXX";
+    char* path = ::mkdtemp(path_template);
+    assert(path != nullptr);
+    const std::filesystem::path original_cwd = std::filesystem::current_path();
+    const std::string root(path);
+
+    auto& runtime = bridge::Runtime::instance();
+    runtime.init(root, "runtime admission test");
+    for (int i = 0; i < 8; ++i) {
+        assert(runtime.add_tcp_server_interface("live-registration", 0) > 0);
+    }
+    const auto timeout = runtime.sync_inbound(0.0);
+    assert(timeout.final_state == "timeout");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    runtime.shutdown();
+
+    std::filesystem::current_path(original_cwd);
+    std::filesystem::remove_all(root);
+}
+
 }  // namespace
 
 int main() {
     preparationFailureLeavesNoDurableOutbound();
     acceptedOwnershipIsDurableAndUsesFinalHash();
+    liveInterfaceRegistrationAndSyncTimeoutAreSafe();
     std::cout << "runtime outbound admission: passed\n";
     return 0;
 }

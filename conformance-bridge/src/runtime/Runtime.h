@@ -119,6 +119,10 @@ private:
     // on its own thread (RNS Transport / Link mutations must occur on the
     // same thread that drives Reticulum::loop()).
     std::atomic<bool> _sync_request_pending{false};
+    std::atomic<bool> _sync_request_started{false};
+    // There is one propagation sync state machine and one callback slot.
+    // Serialize bridge callers so callbacks cannot be replaced concurrently.
+    std::mutex _sync_call_mutex;
 public:
 
     // Path queries.
