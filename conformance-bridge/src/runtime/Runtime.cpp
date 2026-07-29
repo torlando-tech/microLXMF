@@ -211,12 +211,16 @@ void Runtime::worker_loop() {
     using namespace std::chrono;
     while (!_stopping.load()) {
         try {
+            // Reticulum dispatches announce, packet, proof, link and resource
+            // callbacks into LXMRouter. Serialize the entire dispatch/process
+            // pass against bridge-thread router operations, not only the
+            // explicit process_* calls below.
+            std::lock_guard<std::mutex> router_guard(_router_mutex);
             if (_reticulum) {
                 _reticulum->loop();
                 _reticulum->jobs();
             }
             if (_router) {
-                std::lock_guard<std::mutex> router_guard(_router_mutex);
                 _router->process_outbound();
                 _router->process_inbound();
                 if (_sync_request_pending.exchange(false)) {
@@ -272,9 +276,68 @@ void Runtime::announce() {
     _router->announce();
 }
 
-// Common helper — build, pack, queue an LXMessage via the router. Returns
-// the message hash so command handlers can echo it back.
-static Bytes send_message_internal(
+struct DurableAdmissionContext {
+    LXMF::LXMessage& message;
+    LXMF::MessageStore& message_store;
+    std::mutex& message_store_mutex;
+    std::mutex& outbound_mutex;
+    std::map<Bytes, LXMF::Type::Message::State>& outbound_states;
+    bool persisted = false;
+};
+
+static bool persist_prepared_outbound(void* raw_context) noexcept {
+    auto& context = *static_cast<DurableAdmissionContext*>(raw_context);
+    const Bytes hash = context.message.hash();
+    const auto previous_state = context.message.state();
+    bool had_previous_map_state = false;
+    LXMF::Type::Message::State previous_map_state = LXMF::Type::Message::GENERATING;
+
+    try {
+        std::lock_guard<std::mutex> outbound_guard(context.outbound_mutex);
+        auto existing = context.outbound_states.find(hash);
+        if (existing != context.outbound_states.end()) {
+            had_previous_map_state = true;
+            previous_map_state = existing->second;
+        }
+        context.outbound_states[hash] = LXMF::Type::Message::OUTBOUND;
+        context.message.state(LXMF::Type::Message::OUTBOUND);
+
+        bool saved = false;
+        {
+            std::lock_guard<std::mutex> store_guard(context.message_store_mutex);
+            saved = context.message_store.save_message(context.message);
+        }
+        if (!saved) {
+            context.message.state(previous_state);
+            if (had_previous_map_state) {
+                context.outbound_states[hash] = previous_map_state;
+            } else {
+                context.outbound_states.erase(hash);
+            }
+            return false;
+        }
+        context.persisted = true;
+        return true;
+    } catch (...) {
+        context.message.state(previous_state);
+        try {
+            std::lock_guard<std::mutex> outbound_guard(context.outbound_mutex);
+            if (had_previous_map_state) {
+                context.outbound_states[hash] = previous_map_state;
+            } else {
+                context.outbound_states.erase(hash);
+            }
+        } catch (...) {
+            // The bridge will reject admission. Avoid throwing through the
+            // router's C-style guard boundary.
+        }
+        return false;
+    }
+}
+
+// Common helper — build, prepare, durably persist and queue an LXMessage via
+// the router. Returns the final post-stamp message hash.
+Bytes detail::send_message_internal(
     LXMF::LXMRouter& router,
     const Identity& self_identity,
     const Bytes& dest_hash,
@@ -287,7 +350,7 @@ static Bytes send_message_internal(
     std::mutex& router_mutex,
     std::mutex& outbound_mutex,
     std::map<Bytes, LXMF::Type::Message::State>& outbound_states,
-    double timestamp = 0.0)
+    double timestamp)
 {
     Identity recipient_identity = Identity::recall(dest_hash);
     Destination dest{RNS::Type::NONE};
@@ -317,31 +380,28 @@ static Bytes send_message_internal(
     if (timestamp != 0.0) {
         m.timestamp(timestamp);
     }
-    m.pack();
-    Bytes hash = m.hash();
-    // The worker uses this same mutex. Hold it from capacity check through
-    // durable persistence and admission so no persisted OUTBOUND message can
-    // be rejected as full and no queue state can race the worker.
+    // The worker uses this same mutex. Hold it through preparation, the
+    // pre-ownership persistence guard and queue insertion.
     std::lock_guard<std::mutex> router_guard(router_mutex);
     if (!router.outbound_queue_has_capacity()) {
         throw std::runtime_error("outbound queue full");
     }
-    {
-        std::lock_guard<std::mutex> g(message_store_mutex);
-        if (!message_store.save_message(m)) {
-            throw std::runtime_error("durable outbound message persistence failed");
-        }
+    DurableAdmissionContext admission_context{
+        m, message_store, message_store_mutex, outbound_mutex,
+        outbound_states, false};
+    const auto result = router.try_handle_outbound(
+        m, persist_prepared_outbound, &admission_context);
+    if (result == LXMF::OutboundAdmissionResult::QUEUE_FULL) {
+        throw std::runtime_error("outbound queue full");
     }
-    {
-        std::lock_guard<std::mutex> g(outbound_mutex);
-        outbound_states[hash] = LXMF::Type::Message::OUTBOUND;
+    if (result == LXMF::OutboundAdmissionResult::GUARD_REJECTED) {
+        throw std::runtime_error("durable outbound message persistence failed");
     }
-    if (router.try_handle_outbound(m) !=
-        LXMF::OutboundAdmissionResult::ACCEPTED) {
-        throw std::runtime_error(
-            "outbound admission failed after capacity reservation");
+    if (result != LXMF::OutboundAdmissionResult::ACCEPTED ||
+        !admission_context.persisted) {
+        throw std::runtime_error("outbound admission invariant failed");
     }
-    return hash;
+    return m.hash();
 }
 
 Bytes Runtime::send_opportunistic(const Bytes& dest_hash,
@@ -350,7 +410,7 @@ Bytes Runtime::send_opportunistic(const Bytes& dest_hash,
                                   const FieldList& fields,
                                   double timestamp) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
-    return send_message_internal(*_router, _identity, dest_hash, content, title,
+    return detail::send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::OPPORTUNISTIC,
                                  *_message_store, _message_store_mutex,
                                  _router_mutex,
@@ -363,7 +423,7 @@ Bytes Runtime::send_direct(const Bytes& dest_hash,
                            const FieldList& fields,
                            double timestamp) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
-    return send_message_internal(*_router, _identity, dest_hash, content, title,
+    return detail::send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::DIRECT,
                                  *_message_store, _message_store_mutex,
                                  _router_mutex,
@@ -376,7 +436,7 @@ Bytes Runtime::send_propagated(const Bytes& dest_hash,
                                const FieldList& fields,
                                double timestamp) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
-    return send_message_internal(*_router, _identity, dest_hash, content, title,
+    return detail::send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::PROPAGATED,
                                  *_message_store, _message_store_mutex,
                                  _router_mutex,
@@ -385,11 +445,13 @@ Bytes Runtime::send_propagated(const Bytes& dest_hash,
 
 void Runtime::request_path(const Bytes& destination_hash) {
     if (!_initialized.load()) throw std::runtime_error("Runtime not initialized");
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     Transport::request_path(destination_hash);
 }
 
 bool Runtime::has_path(const Bytes& destination_hash) {
     if (!_initialized.load()) return false;
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     return Transport::has_path(destination_hash);
 }
 

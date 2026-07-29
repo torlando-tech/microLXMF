@@ -194,4 +194,21 @@ private:
     std::mutex _lifecycle_mutex;
 };
 
+namespace detail {
+RNS::Bytes send_message_internal(
+    LXMF::LXMRouter& router,
+    const RNS::Identity& self_identity,
+    const RNS::Bytes& dest_hash,
+    const std::string& content,
+    const std::string& title,
+    const Runtime::FieldList& fields,
+    LXMF::Type::Message::Method method,
+    LXMF::MessageStore& message_store,
+    std::mutex& message_store_mutex,
+    std::mutex& router_mutex,
+    std::mutex& outbound_mutex,
+    std::map<RNS::Bytes, LXMF::Type::Message::State>& outbound_states,
+    double timestamp);
+}  // namespace detail
+
 }  // namespace bridge

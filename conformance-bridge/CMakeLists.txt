@@ -319,3 +319,24 @@ target_compile_definitions(test_outbound_admission PRIVATE
     MICROLXMF_NATIVE=1
     NATIVE=1
 )
+
+# Runtime-level regression: fallible stamp preparation must happen before the
+# durable persistence guard, while accepted ownership must persist the final
+# post-preparation hash before queue insertion.
+add_executable(test_runtime_outbound_admission
+    tests/test_runtime_outbound_admission.cpp
+    src/runtime/Runtime.cpp
+    src/runtime/PosixTCPInterface.cpp
+)
+target_include_directories(test_runtime_outbound_admission PRIVATE src)
+target_link_libraries(test_runtime_outbound_admission PRIVATE
+    MicroLXMFLib Threads::Threads)
+target_compile_options(test_runtime_outbound_admission PRIVATE
+    -fexceptions
+    -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+    -Wno-deprecated-declarations
+)
+target_compile_definitions(test_runtime_outbound_admission PRIVATE
+    MICROLXMF_NATIVE=1
+    NATIVE=1
+)
