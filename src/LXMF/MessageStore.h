@@ -10,9 +10,50 @@
 
 namespace LXMF {
 
-	// Fixed pool sizes to eliminate heap fragmentation
-	static constexpr size_t MAX_CONVERSATIONS = 32;
-	static constexpr size_t MAX_MESSAGES_PER_CONVERSATION = 256;
+	// Fixed pool sizes to eliminate heap fragmentation.
+	//
+	// Overridable at build time, because the pool is the product of the two
+	// and the defaults do not fit smaller parts. At 32 and 256,
+	// sizeof(MessageStore) is 275,208 bytes (arm-none-eabi-g++ 7.2.1, cortex-m4,
+	// gnu++17), which is 13,064 bytes more than the entire 256 KB SRAM of an
+	// nRF52840. Such a consumer cannot instantiate the class at all; the build
+	// fails to link. The same measurement gives 37,384 bytes at 16 and 64, and
+	// 10,632 bytes at 8 and 32.
+	//
+	// Defaults are unchanged, so existing builds are unaffected. Override with
+	// e.g. -DLXMF_MAX_CONVERSATIONS=8 -DLXMF_MAX_MESSAGES_PER_CONVERSATION=32.
+#ifndef LXMF_MAX_CONVERSATIONS
+#define LXMF_MAX_CONVERSATIONS 32
+#endif
+#ifndef LXMF_MAX_MESSAGES_PER_CONVERSATION
+#define LXMF_MAX_MESSAGES_PER_CONVERSATION 256
+#endif
+#ifndef LXMF_HOT_MESSAGES_PER_CONVERSATION
+#define LXMF_HOT_MESSAGES_PER_CONVERSATION 50
+#endif
+	// Tested against the macros, not the constants below. A negative override
+	// has already wrapped to a huge size_t by the time it is one of these, so
+	// it would pass a `> 0` test on the constant and fail later as an array
+	// too large to allocate. Zero is the case worth catching: it is accepted
+	// silently as a zero-length array and yields a store that holds nothing.
+	static_assert(LXMF_MAX_CONVERSATIONS > 0,
+		"LXMF_MAX_CONVERSATIONS must be greater than zero");
+	static_assert(LXMF_MAX_MESSAGES_PER_CONVERSATION > 0,
+		"LXMF_MAX_MESSAGES_PER_CONVERSATION must be greater than zero");
+	static_assert(LXMF_HOT_MESSAGES_PER_CONVERSATION > 0,
+		"LXMF_HOT_MESSAGES_PER_CONVERSATION must be greater than zero");
+	// The tiering only means something when the hot count is the smaller of
+	// the two. cull_conversation_to_hot returns immediately while
+	// message_count <= HOT, so a hot count at or above the hard cap can never
+	// be exceeded, the cull never runs, and the archive tier is dead: eviction
+	// deletes the oldest message instead of moving it. That failure is silent,
+	// so it is rejected here rather than discovered later.
+	static_assert(LXMF_HOT_MESSAGES_PER_CONVERSATION < LXMF_MAX_MESSAGES_PER_CONVERSATION,
+		"LXMF_HOT_MESSAGES_PER_CONVERSATION must be less than "
+		"LXMF_MAX_MESSAGES_PER_CONVERSATION, or the archive tier never runs");
+
+	static constexpr size_t MAX_CONVERSATIONS = LXMF_MAX_CONVERSATIONS;
+	static constexpr size_t MAX_MESSAGES_PER_CONVERSATION = LXMF_MAX_MESSAGES_PER_CONVERSATION;
 	static constexpr size_t MESSAGE_HASH_SIZE = 32;  // SHA256 hash
 	static constexpr size_t PEER_HASH_SIZE = 16;     // Truncated hash
 
@@ -37,7 +78,7 @@ namespace LXMF {
 	//
 	// Without an archive filesystem set, cull just deletes — bounded
 	// in-flash storage, but no historical scrollback.
-	static constexpr size_t HOT_MESSAGES_PER_CONVERSATION = 50;
+	static constexpr size_t HOT_MESSAGES_PER_CONVERSATION = LXMF_HOT_MESSAGES_PER_CONVERSATION;
 
 	/**
 	 * @brief Message persistence and conversation management for LXMF
