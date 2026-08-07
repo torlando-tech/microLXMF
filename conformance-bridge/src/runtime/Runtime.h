@@ -119,6 +119,10 @@ private:
     // on its own thread (RNS Transport / Link mutations must occur on the
     // same thread that drives Reticulum::loop()).
     std::atomic<bool> _sync_request_pending{false};
+    std::atomic<bool> _sync_request_started{false};
+    // There is one propagation sync state machine and one callback slot.
+    // Serialize bridge callers so callbacks cannot be replaced concurrently.
+    std::mutex _sync_call_mutex;
 public:
 
     // Path queries.
@@ -168,6 +172,8 @@ private:
     // LXMF router. shared_ptr because LXMRouter::Ptr exists for
     // co-ownership patterns.
     std::shared_ptr<LXMF::LXMRouter> _router;
+    // Serializes bridge request-thread and worker-thread router operations.
+    std::mutex _router_mutex;
     std::unique_ptr<LXMF::MessageStore> _message_store;
     std::mutex _message_store_mutex;
 
@@ -191,5 +197,22 @@ private:
     // Top-level mutex around init/shutdown + interface registration.
     std::mutex _lifecycle_mutex;
 };
+
+namespace detail {
+RNS::Bytes send_message_internal(
+    LXMF::LXMRouter& router,
+    const RNS::Identity& self_identity,
+    const RNS::Bytes& dest_hash,
+    const std::string& content,
+    const std::string& title,
+    const Runtime::FieldList& fields,
+    LXMF::Type::Message::Method method,
+    LXMF::MessageStore& message_store,
+    std::mutex& message_store_mutex,
+    std::mutex& router_mutex,
+    std::mutex& outbound_mutex,
+    std::map<RNS::Bytes, LXMF::Type::Message::State>& outbound_states,
+    double timestamp);
+}  // namespace detail
 
 }  // namespace bridge

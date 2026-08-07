@@ -179,15 +179,36 @@ void PosixTCPInterface::reader_loop() {
             Bytes unescaped = HDLC::unescape(content);
             if (unescaped.size() == 0) continue;
             if (unescaped.size() < Type::Reticulum::HEADER_MINSIZE) continue;
-            // Pass to the RNS Transport layer.
-            try {
-                InterfaceImpl::handle_incoming(unescaped);
-            } catch (const std::exception& e) {
-                ERROR("PosixTCPInterface: handle_incoming threw: " + std::string(e.what()));
+            // Reader threads must not enter process-global Reticulum state.
+            // Runtime drains this bounded queue while holding _router_mutex.
+            {
+                std::lock_guard<std::mutex> lock(_incoming_mutex);
+                if (_incoming.size() >= MAX_PENDING_INBOUND) {
+                    WARNING("PosixTCPInterface: inbound queue full; dropping frame");
+                } else {
+                    _incoming.push_back(unescaped);
+                }
             }
         }
     }
     _online = false;
+}
+
+void PosixTCPInterface::drain_incoming() {
+    for (std::size_t processed = 0; processed < MAX_DRAIN_PER_TICK; ++processed) {
+        Bytes frame;
+        {
+            std::lock_guard<std::mutex> lock(_incoming_mutex);
+            if (_incoming.empty()) return;
+            frame = _incoming.front();
+            _incoming.pop_front();
+        }
+        try {
+            InterfaceImpl::handle_incoming(frame);
+        } catch (const std::exception& e) {
+            ERROR("PosixTCPInterface: handle_incoming threw: " + std::string(e.what()));
+        }
+    }
 }
 
 bool PosixTCPInterface::send_outgoing(const Bytes& data) {

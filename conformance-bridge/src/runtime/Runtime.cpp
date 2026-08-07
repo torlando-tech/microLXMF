@@ -211,6 +211,14 @@ void Runtime::worker_loop() {
     using namespace std::chrono;
     while (!_stopping.load()) {
         try {
+            // Reticulum dispatches announce, packet, proof, link and resource
+            // callbacks into LXMRouter. Serialize the entire dispatch/process
+            // pass against bridge-thread router operations, not only the
+            // explicit process_* calls below.
+            std::lock_guard<std::mutex> router_guard(_router_mutex);
+            for (const auto& interface : _interfaces) {
+                if (interface) interface->drain_incoming();
+            }
             if (_reticulum) {
                 _reticulum->loop();
                 _reticulum->jobs();
@@ -220,6 +228,7 @@ void Runtime::worker_loop() {
                 _router->process_inbound();
                 if (_sync_request_pending.exchange(false)) {
                     _router->request_messages_from_propagation_node();
+                    _sync_request_started.store(true);
                 }
                 _router->process_sync();
             }
@@ -231,7 +240,9 @@ void Runtime::worker_loop() {
 }
 
 int Runtime::add_tcp_server_interface(const std::string& name, int port) {
+    std::lock_guard<std::mutex> lifecycle_guard(_lifecycle_mutex);
     if (!_initialized.load()) throw std::runtime_error("Runtime not initialized");
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     auto impl = std::make_shared<PosixTCPInterface>(
         name.c_str(), PosixTCPInterface::SERVER);
     impl->set_bind("127.0.0.1", port);
@@ -239,11 +250,10 @@ int Runtime::add_tcp_server_interface(const std::string& name, int port) {
         throw std::runtime_error("PosixTCPInterface(SERVER): start failed");
     }
     int bound = impl->bound_port();
-    // Register as RNS interface. Interface(InterfaceImpl*) takes
-    // ownership via shared_ptr — but our impl is already in a shared_ptr,
-    // so we hand a raw aliased pointer over and Interface's shared_ptr
-    // will reference the same control block.
-    auto handle = std::unique_ptr<Interface>(new Interface(impl.get()));
+    // Share the existing control block with the RNS handle. Passing impl.get()
+    // would create a second owning shared_ptr and double-delete the interface.
+    std::shared_ptr<InterfaceImpl> shared_impl = impl;
+    auto handle = std::unique_ptr<Interface>(new Interface(shared_impl));
     Transport::register_interface(*handle);
     _interfaces.push_back(impl);
     _iface_handles.push_back(std::move(handle));
@@ -252,14 +262,17 @@ int Runtime::add_tcp_server_interface(const std::string& name, int port) {
 
 void Runtime::add_tcp_client_interface(const std::string& name,
                                        const std::string& host, int port) {
+    std::lock_guard<std::mutex> lifecycle_guard(_lifecycle_mutex);
     if (!_initialized.load()) throw std::runtime_error("Runtime not initialized");
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     auto impl = std::make_shared<PosixTCPInterface>(
         name.c_str(), PosixTCPInterface::CLIENT);
     impl->set_target(host, port);
     if (!impl->start_iface()) {
         throw std::runtime_error("PosixTCPInterface(CLIENT): start failed");
     }
-    auto handle = std::unique_ptr<Interface>(new Interface(impl.get()));
+    std::shared_ptr<InterfaceImpl> shared_impl = impl;
+    auto handle = std::unique_ptr<Interface>(new Interface(shared_impl));
     Transport::register_interface(*handle);
     _interfaces.push_back(impl);
     _iface_handles.push_back(std::move(handle));
@@ -267,12 +280,72 @@ void Runtime::add_tcp_client_interface(const std::string& name,
 
 void Runtime::announce() {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     _router->announce();
 }
 
-// Common helper — build, pack, queue an LXMessage via the router. Returns
-// the message hash so command handlers can echo it back.
-static Bytes send_message_internal(
+struct DurableAdmissionContext {
+    LXMF::LXMessage& message;
+    LXMF::MessageStore& message_store;
+    std::mutex& message_store_mutex;
+    std::mutex& outbound_mutex;
+    std::map<Bytes, LXMF::Type::Message::State>& outbound_states;
+    bool persisted = false;
+};
+
+static bool persist_prepared_outbound(void* raw_context) noexcept {
+    auto& context = *static_cast<DurableAdmissionContext*>(raw_context);
+    const Bytes hash = context.message.hash();
+    const auto previous_state = context.message.state();
+    bool had_previous_map_state = false;
+    LXMF::Type::Message::State previous_map_state = LXMF::Type::Message::GENERATING;
+
+    try {
+        std::lock_guard<std::mutex> outbound_guard(context.outbound_mutex);
+        auto existing = context.outbound_states.find(hash);
+        if (existing != context.outbound_states.end()) {
+            had_previous_map_state = true;
+            previous_map_state = existing->second;
+        }
+        context.outbound_states[hash] = LXMF::Type::Message::OUTBOUND;
+        context.message.state(LXMF::Type::Message::OUTBOUND);
+
+        bool saved = false;
+        {
+            std::lock_guard<std::mutex> store_guard(context.message_store_mutex);
+            saved = context.message_store.save_message(context.message);
+        }
+        if (!saved) {
+            context.message.state(previous_state);
+            if (had_previous_map_state) {
+                context.outbound_states[hash] = previous_map_state;
+            } else {
+                context.outbound_states.erase(hash);
+            }
+            return false;
+        }
+        context.persisted = true;
+        return true;
+    } catch (...) {
+        context.message.state(previous_state);
+        try {
+            std::lock_guard<std::mutex> outbound_guard(context.outbound_mutex);
+            if (had_previous_map_state) {
+                context.outbound_states[hash] = previous_map_state;
+            } else {
+                context.outbound_states.erase(hash);
+            }
+        } catch (...) {
+            // The bridge will reject admission. Avoid throwing through the
+            // router's C-style guard boundary.
+        }
+        return false;
+    }
+}
+
+// Common helper — build, prepare, durably persist and queue an LXMessage via
+// the router. Returns the final post-stamp message hash.
+Bytes detail::send_message_internal(
     LXMF::LXMRouter& router,
     const Identity& self_identity,
     const Bytes& dest_hash,
@@ -282,9 +355,10 @@ static Bytes send_message_internal(
     LXMF::Type::Message::Method method,
     LXMF::MessageStore& message_store,
     std::mutex& message_store_mutex,
+    std::mutex& router_mutex,
     std::mutex& outbound_mutex,
     std::map<Bytes, LXMF::Type::Message::State>& outbound_states,
-    double timestamp = 0.0)
+    double timestamp)
 {
     Identity recipient_identity = Identity::recall(dest_hash);
     Destination dest{RNS::Type::NONE};
@@ -314,20 +388,28 @@ static Bytes send_message_internal(
     if (timestamp != 0.0) {
         m.timestamp(timestamp);
     }
-    m.pack();
-    Bytes hash = m.hash();
-    {
-        std::lock_guard<std::mutex> g(message_store_mutex);
-        if (!message_store.save_message(m)) {
-            throw std::runtime_error("durable outbound message persistence failed");
-        }
+    // The worker uses this same mutex. Hold it through preparation, the
+    // pre-ownership persistence guard and queue insertion.
+    std::lock_guard<std::mutex> router_guard(router_mutex);
+    if (!router.outbound_queue_has_capacity()) {
+        throw std::runtime_error("outbound queue full");
     }
-    {
-        std::lock_guard<std::mutex> g(outbound_mutex);
-        outbound_states[hash] = LXMF::Type::Message::OUTBOUND;
+    DurableAdmissionContext admission_context{
+        m, message_store, message_store_mutex, outbound_mutex,
+        outbound_states, false};
+    const auto result = router.try_handle_outbound(
+        m, persist_prepared_outbound, &admission_context);
+    if (result == LXMF::OutboundAdmissionResult::QUEUE_FULL) {
+        throw std::runtime_error("outbound queue full");
     }
-    router.handle_outbound(m);
-    return hash;
+    if (result == LXMF::OutboundAdmissionResult::GUARD_REJECTED) {
+        throw std::runtime_error("durable outbound message persistence failed");
+    }
+    if (result != LXMF::OutboundAdmissionResult::ACCEPTED ||
+        !admission_context.persisted) {
+        throw std::runtime_error("outbound admission invariant failed");
+    }
+    return m.hash();
 }
 
 Bytes Runtime::send_opportunistic(const Bytes& dest_hash,
@@ -336,9 +418,10 @@ Bytes Runtime::send_opportunistic(const Bytes& dest_hash,
                                   const FieldList& fields,
                                   double timestamp) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
-    return send_message_internal(*_router, _identity, dest_hash, content, title,
+    return detail::send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::OPPORTUNISTIC,
                                  *_message_store, _message_store_mutex,
+                                 _router_mutex,
                                  _outbound_mutex, _outbound_states, timestamp);
 }
 
@@ -348,9 +431,10 @@ Bytes Runtime::send_direct(const Bytes& dest_hash,
                            const FieldList& fields,
                            double timestamp) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
-    return send_message_internal(*_router, _identity, dest_hash, content, title,
+    return detail::send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::DIRECT,
                                  *_message_store, _message_store_mutex,
+                                 _router_mutex,
                                  _outbound_mutex, _outbound_states, timestamp);
 }
 
@@ -360,58 +444,97 @@ Bytes Runtime::send_propagated(const Bytes& dest_hash,
                                const FieldList& fields,
                                double timestamp) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
-    return send_message_internal(*_router, _identity, dest_hash, content, title,
+    return detail::send_message_internal(*_router, _identity, dest_hash, content, title,
                                  fields, LXMF::Type::Message::PROPAGATED,
                                  *_message_store, _message_store_mutex,
+                                 _router_mutex,
                                  _outbound_mutex, _outbound_states, timestamp);
 }
 
 void Runtime::request_path(const Bytes& destination_hash) {
     if (!_initialized.load()) throw std::runtime_error("Runtime not initialized");
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     Transport::request_path(destination_hash);
 }
 
 bool Runtime::has_path(const Bytes& destination_hash) {
     if (!_initialized.load()) return false;
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     return Transport::has_path(destination_hash);
 }
 
 void Runtime::set_outbound_propagation_node(const Bytes& node_hash, uint8_t stamp_cost) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
+    std::lock_guard<std::mutex> router_guard(_router_mutex);
     _router->set_outbound_propagation_node(node_hash);
     _router->set_outbound_propagation_stamp_cost(stamp_cost);
 }
 
 Runtime::SyncResult Runtime::sync_inbound(double timeout_sec) {
     if (!_router) throw std::runtime_error("LXMRouter not initialized");
+    std::lock_guard<std::mutex> sync_call_guard(_sync_call_mutex);
 
-    // Latch the result via the sync-complete callback. The router fires
-    // the callback exactly once on PR_COMPLETE; failures just leave the
-    // state at PR_FAILED, which we observe by polling.
+    // Latch the result via the sync-complete callback. The callback captures
+    // stack state, so every exit path clears it while holding the same mutex
+    // used for callback dispatch.
     std::atomic<size_t> received{0};
     std::atomic<bool> completed{false};
-    _router->register_sync_complete_callback(
-        [&](size_t n) { received.store(n); completed.store(true); });
+    bool attach_to_active_sync = false;
+    {
+        std::lock_guard<std::mutex> router_guard(_router_mutex);
+        const auto state = _router->get_sync_state();
+        attach_to_active_sync =
+            state != LXMF::LXMRouter::PR_IDLE &&
+            state != LXMF::LXMRouter::PR_COMPLETE &&
+            state != LXMF::LXMRouter::PR_FAILED;
+        _router->register_sync_complete_callback(
+            [&](size_t n) { received.store(n); completed.store(true); });
+    }
 
-    // Defer the actual request to the worker thread — the LXMRouter
-    // sync state machine touches RNS Transport / Link state that must
-    // be mutated on the loop thread.
-    _sync_request_pending.store(true);
+    if (attach_to_active_sync) {
+        // A previous caller timed out while the global router sync continued.
+        // Observe that same operation instead of starting a second request and
+        // misattributing the first operation's completion.
+        _sync_request_started.store(true);
+    } else {
+        // Defer a new request to the worker thread. Ignore a previous terminal
+        // router state until the worker has actually started this request.
+        _sync_request_started.store(false);
+        _sync_request_pending.store(true);
+    }
+
+    auto finish = [&](const char* state, size_t count, bool terminal) {
+        std::lock_guard<std::mutex> router_guard(_router_mutex);
+        _router->register_sync_complete_callback({});
+        if (terminal) {
+            _sync_request_started.store(false);
+        }
+        return SyncResult{state, count};
+    };
 
     using namespace std::chrono;
     auto deadline = steady_clock::now() + duration_cast<steady_clock::duration>(
         duration<double>(timeout_sec));
     while (steady_clock::now() < deadline) {
-        auto st = _router->get_sync_state();
-        if (completed.load() || st == LXMF::LXMRouter::PR_COMPLETE) {
-            return {"complete", received.load()};
+        LXMF::LXMRouter::PropagationSyncState state;
+        {
+            std::lock_guard<std::mutex> router_guard(_router_mutex);
+            state = _router->get_sync_state();
         }
-        if (st == LXMF::LXMRouter::PR_FAILED) {
-            return {"failed", 0};
+        if (completed.load()) {
+            return finish("complete", received.load(), true);
+        }
+        if (_sync_request_started.load()) {
+            if (state == LXMF::LXMRouter::PR_COMPLETE) {
+                return finish("complete", received.load(), true);
+            }
+            if (state == LXMF::LXMRouter::PR_FAILED) {
+                return finish("failed", 0, true);
+            }
         }
         std::this_thread::sleep_for(milliseconds(50));
     }
-    return {"timeout", received.load()};
+    return finish("timeout", received.load(), false);
 }
 
 std::vector<Runtime::ReceivedMsg> Runtime::get_received_messages(

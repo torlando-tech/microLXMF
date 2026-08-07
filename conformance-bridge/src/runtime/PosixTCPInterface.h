@@ -9,7 +9,7 @@
 //
 // Owns:
 //   - one socket fd
-//   - one reader thread (deframes HDLC, calls handle_incoming)
+//   - one reader thread (deframes HDLC into a bounded queue)
 //   - one write mutex (send_outgoing is called from the bridge command
 //     thread; reader thread doesn't write)
 //
@@ -22,6 +22,7 @@
 #include <microReticulum/Log.h>
 
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -65,9 +66,13 @@ public:
     bool start_iface();
     void stop_iface();
 
+    // Called only by Runtime's serialized worker pass. Dispatches bounded
+    // queued frames into Reticulum so TCP reader threads never mutate global
+    // Transport/router state concurrently.
+    void drain_incoming();
+
 private:
-    // Reader thread body — drives recv() loop, deframes HDLC, calls
-    // InterfaceImpl::handle_incoming for each complete frame.
+    // Reader thread body — drives recv() loop and queues complete HDLC frames.
     void reader_loop();
     // SERVER mode: accept() loop body. Currently accepts one peer then
     // hands control back to reader_loop.
@@ -86,6 +91,10 @@ private:
     int _listen_socket = -1;  // SERVER mode only
     int _data_socket = -1;
     std::mutex _write_mutex;
+    static constexpr std::size_t MAX_PENDING_INBOUND = 128;
+    static constexpr std::size_t MAX_DRAIN_PER_TICK = 64;
+    std::mutex _incoming_mutex;
+    std::deque<RNS::Bytes> _incoming;
     std::thread _reader_thread;
 };
 
