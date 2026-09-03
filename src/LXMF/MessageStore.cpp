@@ -65,6 +65,7 @@ void MessageStore::ConversationInfo::clear() {
 	memset(last_message_hash, 0, MESSAGE_HASH_SIZE);
 	memset(display_name, 0, sizeof(display_name));
 	memset(last_preview, 0, sizeof(last_preview));
+	preview_valid = false;
 }
 
 // ConversationSlot helper method
@@ -263,17 +264,20 @@ bool MessageStore::load_index_file(const std::string& index_path) {
 				}
 			}
 
-			// Restore the cached last-message preview. Optional field:
-			// index generations written before the field exists leave the
-			// cache empty, and the first list refresh falls back to
-			// reading the newest message file (which re-pops the cache on
-			// the next save).
+			// Restore the cached last-message preview. Both fields are
+			// optional: index generations written before they exist leave
+			// the cache unpopulated, and the first list refresh falls back
+			// to reading the newest message file (which re-pops the cache
+			// and, via the caller's deferred commit, persists it).
 			if (!conv["last_preview"].isNull()) {
 				const char* lp = conv["last_preview"];
 				if (lp) {
 					strncpy(slot.info.last_preview, lp, MAX_LAST_PREVIEW_LEN);
 					slot.info.last_preview[MAX_LAST_PREVIEW_LEN] = '\0';
 				}
+			}
+			if (!conv["preview_valid"].isNull()) {
+				slot.info.preview_valid = conv["preview_valid"].as<bool>();
 			}
 
 			++slot_index;
@@ -326,9 +330,13 @@ bool MessageStore::save_index(bool empty) {
 
 			// Persist the last-message preview the same way: cold-boot
 			// conversation lists read it straight out of the index instead
-			// of opening + parsing every newest message file.
-			if (info.last_preview[0] != '\0') {
+			// of opening + parsing every newest message file. The
+			// preview_valid flag is persisted even when the preview is
+			// empty (empty-content tail): an unpopulated cache must
+			// re-fall-back on the next boot, a cached empty one must not.
+			if (info.preview_valid) {
 				conv["last_preview"] = info.last_preview;
+				conv["preview_valid"] = true;
 			}
 
 			// Serialize message hashes
@@ -582,19 +590,22 @@ bool MessageStore::save_message(const LXMessage& message) {
 				conv.last_activity = message.timestamp();
 				conv.set_last_message_hash(message.hash());
 
-				// Cache the preview so conversation-list refreshes don't need
-				// to open + parse the newest message file (see
-				// get_last_message_preview). The first MAX_LAST_PREVIEW_LEN
-				// bytes of the content are what the list shows.
+				// Cache the preview so conversation-list refreshes don't
+				// need to open + parse the newest message file (see
+				// get_last_message_preview). The first
+				// MAX_LAST_PREVIEW_LEN bytes of the content are what the
+				// list shows. An empty-content message caches an EMPTY
+				// preview with preview_valid=true — "I already know the
+				// tail is empty" — so the list never re-reads it.
 				const RNS::Bytes& content = message.content();
-				if (content.size() > 0) {
-					memset(conv.last_preview, 0, sizeof(conv.last_preview));
-					strncpy(conv.last_preview,
-					        (const char*)content.data(),
-					        MAX_LAST_PREVIEW_LEN);
-				} else {
-					conv.last_preview[0] = '\0';  // no content -> stale, fall back
-				}
+				// Bounded memcpy: content() is a Bytes, NOT nul-terminated —
+				// strncpy would over-read past the buffer.
+				memset(conv.last_preview, 0, sizeof(conv.last_preview));
+				size_t n = content.size();
+				if (n > MAX_LAST_PREVIEW_LEN) n = MAX_LAST_PREVIEW_LEN;
+				memcpy(conv.last_preview, content.data(), n);
+				conv.last_preview[n] = '\0';
+				conv.preview_valid = true;
 
 				// Increment unread count for incoming messages
 				if (message.incoming()) {
@@ -1249,12 +1260,14 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 					memset(conv.last_message_hash, 0, MESSAGE_HASH_SIZE);
 				}
 				// The cached preview belongs to the deleted message.
-				// Clearing it forces the next list refresh to read the new
-				// tail via load_message_metadata (one-time I/O per
-				// deleted-tail conversation, then the cache re-pops on the
-				// next save). Re-reading the new tail's content here would
-				// add an I/O path to deletion for a one-time benefit.
+				// Clearing it (preview_valid=false) forces the next list
+				// refresh to read the new tail via load_message_metadata
+				// (one-time I/O per deleted-tail conversation, then the cache
+				// re-pops — empty-content tails included). Re-reading the new
+				// tail's content here would add an I/O path to deletion for a
+				// one-time benefit.
 				memset(conv.last_preview, 0, sizeof(conv.last_preview));
+				conv.preview_valid = false;
 			}
 
 			DEBUG("  Removed from conversation");
@@ -1361,6 +1374,8 @@ size_t MessageStore::get_conversation_unread_count(const Bytes& peer_hash) const
 
 // Get cached last-message preview for one conversation. O(1) in-memory
 // lookup, no filesystem I/O — see the header for the fallback contract.
+// Note: returning true with an EMPTY out_preview is valid — it means the
+// tail is a cached empty-content message.
 bool MessageStore::get_last_message_preview(const Bytes& peer_hash,
                                             std::string& out_preview,
                                             double& out_timestamp) const {
@@ -1368,7 +1383,7 @@ bool MessageStore::get_last_message_preview(const Bytes& peer_hash,
 	if (!slot || slot->info.message_count == 0) {
 		return false;
 	}
-	if (slot->info.last_preview[0] == '\0') {
+	if (!slot->info.preview_valid) {
 		return false;
 	}
 	out_preview = slot->info.last_preview;
@@ -1377,18 +1392,25 @@ bool MessageStore::get_last_message_preview(const Bytes& peer_hash,
 }
 
 // Set (or clear) the cached last-message preview for a conversation.
-// Maintained by save_message / delete_message; does not commit the index.
+// An empty preview is a valid cached state (empty-content tail) and is
+// marked populated; callers only fall back to the file when the cache is
+// unpopulated (preview_valid=false). Maintained by save_message /
+// delete_message and by callers warming the cache from a fallback read;
+// does not commit the index.
 void MessageStore::set_last_message_preview(const Bytes& peer_hash,
                                             const std::string& preview) {
 	ConversationSlot* slot = find_conversation(peer_hash);
 	if (!slot) {
 		return;
 	}
+	// Always clear first: the new preview may be shorter (or empty) than
+	// the previous one, and a stale tail would leak into it.
 	memset(slot->info.last_preview, 0, sizeof(slot->info.last_preview));
 	if (!preview.empty()) {
 		strncpy(slot->info.last_preview, preview.c_str(), MAX_LAST_PREVIEW_LEN);
 	}
 	slot->info.last_preview[MAX_LAST_PREVIEW_LEN] = '\0';
+	slot->info.preview_valid = true;
 }
 
 // Mark conversation as read

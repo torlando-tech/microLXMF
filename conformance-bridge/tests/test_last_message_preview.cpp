@@ -345,6 +345,20 @@ static void test_preview_persists_across_reconstruction() {
         EXPECT_EQ((long long)ts, (long long)1700000000LL,
                   "timestamp restored from index");
     }
+    {
+        // Empty-content tail round-trips as a populated empty cache, so a
+        // cold boot does NOT fall back to the file for it.
+        MessageStore store("/lxmf");
+        LXMessage m = make_message(peer, self, 1700000001.0, "", true);
+        EXPECT_TRUE(store.save_message(m), "save empty tail before reboot");
+    }
+    {
+        MessageStore store("/lxmf");
+        std::string preview; double ts = 0;
+        EXPECT_TRUE(store.get_last_message_preview(peer, preview, ts),
+                    "empty tail restored as populated cache");
+        EXPECT_EQ(preview, std::string(""), "restored preview is empty");
+    }
     RNS::Utilities::OS::deregister_filesystem();
     rmrf(root);
 }
@@ -366,13 +380,35 @@ static void test_empty_content_and_unknown_peer() {
         EXPECT_TRUE(!store.get_last_message_preview(peer_hash(0x99), preview, ts),
                     "unknown peer has no preview");
 
-        // Empty-content message: cache stays empty (fallback contract).
+        // Empty-content message: cached as an EMPTY preview with the
+        // cache marked populated — the list must not re-read this file
+        // (location shares, blank pings). Fallback contract is only for
+        // an unpopulated cache.
         LXMessage m = make_message(peer, self, 1700000000.0, "", true);
         EXPECT_TRUE(store.save_message(m), "save empty-content message");
         EXPECT_TRUE(store.get_last_message_hash(peer) == m.hash(),
                     "tail hash is set");
-        EXPECT_TRUE(!store.get_last_message_preview(peer, preview, ts),
-                    "empty content leaves preview empty");
+        EXPECT_TRUE(store.get_last_message_preview(peer, preview, ts),
+                    "empty content is a valid cached preview");
+        EXPECT_EQ(preview, std::string(""), "preview is empty");
+        EXPECT_EQ((long long)ts, (long long)1700000000LL,
+                  "timestamp restored for empty tail");
+
+        // Re-pop via the explicit accessor (the Pyxis fallback warm-up
+        // path): an empty preview still marks the cache populated.
+        store.set_last_message_preview(peer, "");
+        preview.clear(); ts = 0;
+        EXPECT_TRUE(store.get_last_message_preview(peer, preview, ts),
+                    "set(empty) marks cache populated");
+        EXPECT_EQ(preview, std::string(""), "still empty");
+
+        // A new non-empty tail replaces it.
+        LXMessage m2 = make_message(peer, self, 1700000010.0, "after empty",
+                                    false);
+        EXPECT_TRUE(store.save_message(m2), "save after empty");
+        EXPECT_TRUE(store.get_last_message_preview(peer, preview, ts),
+                    "new tail cached");
+        EXPECT_EQ(preview, std::string("after empty"), "preview updated");
     }
     RNS::Utilities::OS::deregister_filesystem();
     rmrf(root);

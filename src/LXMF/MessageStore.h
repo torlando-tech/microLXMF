@@ -79,9 +79,14 @@ namespace LXMF {
 		// deserialize dominate the load path on SPI flash). The cache is
 		// written when the last message is stored, persisted in the
 		// conversation index, and cleared whenever the last message is
-		// replaced (delete, hard-cap eviction, out-of-order save). Empty
-		// means "no cached preview" and callers fall back to reading the
-		// message file (old index generations, empty-content messages).
+		// replaced (delete, hard-cap eviction, out-of-order save).
+		// preview_valid is the "cache is populated" signal (NOT a non-empty
+		// string): empty-content messages (location shares, blank pings)
+		// also get cached — as an empty preview with preview_valid=true —
+		// so callers never re-read the message file for a tail they have
+		// already seen. preview_valid=false means "no cached preview" and
+		// callers fall back to reading the message file (old index
+		// generations, or the one-shot warm-up after a delete/clear).
 		static constexpr size_t MAX_LAST_PREVIEW_LEN = 47;  // 47 + nul = 48
 
 		struct ConversationInfo {
@@ -95,10 +100,14 @@ namespace LXMF {
 			uint8_t last_message_hash[MESSAGE_HASH_SIZE];
 			char display_name[MAX_DISPLAY_NAME_LEN + 1] = {0};  // Last seen, nul-terminated
 			// Preview of the last message's content (first 47 chars), kept in
-			// sync with last_message_hash. Empty when last_message_hash is
-			// unset, when the last message has no content, or when the index
-			// generation predates the field (load leaves it empty).
+			// sync with last_message_hash. preview_valid=true means the
+			// preview reflects the current last message — including an
+			// empty string for empty-content messages. preview_valid=false
+			// (default, after clear()/delete/cull, or when the index
+			// generation predates the field) means callers must fall back
+			// to reading the message file.
 			char last_preview[MAX_LAST_PREVIEW_LEN + 1] = {0};
+			bool preview_valid = false;
 
 			// Helper methods for accessing fixed arrays as Bytes
 			RNS::Bytes peer_hash_bytes() const { return RNS::Bytes(peer_hash, PEER_HASH_SIZE); }
@@ -355,13 +364,17 @@ namespace LXMF {
 		 * conversation list needs and it removes one LittleFS open + read
 		 * + JSON parse per conversation from every list refresh.
 		 *
-		 * Returns false (and leaves outputs untouched) when there is no
-		 * cached preview: no conversation, no last message, empty message
-		 * content, or an index generation that predates the field.
-		 * Callers fall back to load_message_metadata() in that case.
+		 * out_preview may be empty: that is a legitimate cached preview
+		 * for an empty-content last message (location share, blank ping).
+		 * Returns false (and leaves outputs untouched) only when no
+		 * cached preview exists: no conversation, no last message, or the
+		 * cache is unpopulated (old index generation, or a tail replaced
+		 * since the last cache write). Callers fall back to
+		 * load_message_metadata() in that case and should re-pop the
+		 * cache with set_last_message_preview().
 		 *
 		 * @param peer_hash Hash of the peer
-		 * @param out_preview Receives the cached preview (nul-terminated)
+		 * @param out_preview Receives the cached preview (may be empty)
 		 * @param out_timestamp Receives the last message's timestamp
 		 * @return True when a cached preview is available
 		 */
@@ -372,8 +385,11 @@ namespace LXMF {
 		/**
 		 * @brief Set (or clear, when preview is empty) the cached preview
 		 *
-		 * Maintained automatically by save_message / delete_message;
-		 * exposed for tests. Does NOT commit the index.
+		 * An empty preview is a valid cached state: it marks the current
+		 * empty-content tail as "already read" so callers do not re-read
+		 * the message file on every refresh. Maintained automatically by
+		 * save_message / delete_message; also used by callers that
+		 * warm the cache from a fallback read. Does NOT commit the index.
 		 */
 		void set_last_message_preview(const RNS::Bytes& peer_hash,
 		                              const std::string& preview);
