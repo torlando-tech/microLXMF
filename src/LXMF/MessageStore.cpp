@@ -75,12 +75,22 @@ void MessageStore::ConversationSlot::clear() {
 	info.clear();
 }
 
+namespace {
+// Forward declaration (defined below with the cache table): one-time
+// allocation/initialization of the message-metadata cache.
+void meta_cache_init();
+}  // namespace
+
 // Constructor
 MessageStore::MessageStore(const std::string& base_path) :
 	_base_path(base_path),
 	_initialized(false)
 {
 	INFO("Initializing MessageStore at: " + _base_path);
+
+	// One-time PSRAM allocation for the metadata cache (ESP32); no-op
+	// on the host build. Runs before any load can touch the table.
+	meta_cache_init();
 
 	// Initialize pool
 	for (size_t i = 0; i < MAX_CONVERSATIONS; ++i) {
@@ -105,9 +115,17 @@ MessageStore::~MessageStore() {
 // ----- Message metadata cache (see MessageStore.h MESSAGE_METADATA_CACHE_*) -----
 // File scope in an anonymous namespace: process-lifetime, so reopening a
 // conversation (or paging older messages) does not re-read message files
-// from SPI flash. The ~41 KiB table is static, not per-MessageStore-
-// instance, and stays outside the class so it is not visible (or
-// allocatable) from headers.
+// from SPI flash. The ~41 KiB table lives outside the class so it is not
+// visible (or allocatable) from headers.
+//
+// Placement: on ESP32 (ARDUINO) the table is allocated from PSRAM in
+// meta_cache_init() — a static .bss table would consume 41 KiB of internal
+// DRAM, which is tight enough to fail the LVGL task's 8 KiB stack
+// allocation at boot (observed: "Failed to create LVGL task" with the
+// table in .bss). PSRAM has multi-MB headroom and the cache is a pure
+// speed feature: if the allocation fails, meta_cache stays null and every
+// load_message_metadata() falls back to a disk read (pre-cache behavior).
+// The host conformance build (no ARDUINO) uses the static table.
 namespace {
 
 struct MetadataCacheSlot {
@@ -119,10 +137,42 @@ struct MetadataCacheSlot {
 	int state = 0;
 };
 
-MetadataCacheSlot meta_cache[MessageStore::MESSAGE_METADATA_CACHE_ENTRIES];
+#ifdef ARDUINO
+#include <esp_heap_caps.h>
+MetadataCacheSlot* meta_cache = nullptr;  // PSRAM, set by meta_cache_init()
+#else
+static MetadataCacheSlot meta_cache_static[MessageStore::MESSAGE_METADATA_CACHE_ENTRIES];
+MetadataCacheSlot* meta_cache = meta_cache_static;
+#endif
 size_t meta_cache_next = 0;  // FIFO eviction pointer
 
+void meta_cache_init() {
+#ifdef ARDUINO
+	if (meta_cache) {
+		return;  // already allocated (constructor ran once)
+	}
+	meta_cache = (MetadataCacheSlot*)psram_malloc(
+	    sizeof(MetadataCacheSlot) * MessageStore::MESSAGE_METADATA_CACHE_ENTRIES);
+	if (meta_cache) {
+		memset(meta_cache, 0,
+		       sizeof(MetadataCacheSlot) * MessageStore::MESSAGE_METADATA_CACHE_ENTRIES);
+		INFO("MessageStore: metadata cache in PSRAM (" +
+		     std::to_string(sizeof(MetadataCacheSlot) *
+				    MessageStore::MESSAGE_METADATA_CACHE_ENTRIES) +
+		     " bytes)");
+	} else {
+		WARNING("MessageStore: metadata cache disabled (PSRAM allocation failed)");
+	}
+#else
+	// Host build: static table, nothing to initialize.
+#endif
+}
+
 bool meta_cache_find(const RNS::Bytes& hash, MetadataCacheSlot** slot) {
+	*slot = nullptr;
+	if (!meta_cache) {
+		return false;  // cache disabled (allocation failed) -> disk read
+	}
 	for (size_t i = 0; i < MessageStore::MESSAGE_METADATA_CACHE_ENTRIES; ++i) {
 		if (meta_cache[i].in_use &&
 		    memcmp(meta_cache[i].hash, hash.data(),
@@ -131,12 +181,14 @@ bool meta_cache_find(const RNS::Bytes& hash, MetadataCacheSlot** slot) {
 			return true;
 		}
 	}
-	*slot = nullptr;
 	return false;
 }
 
 void meta_cache_insert(const RNS::Bytes& hash, const std::string& content,
                        double timestamp, bool incoming, int state) {
+	if (!meta_cache) {
+		return;  // cache disabled -> nothing to warm
+	}
 	MetadataCacheSlot* slot = nullptr;
 	if (!meta_cache_find(hash, &slot)) {
 		// First-fit free slot; FIFO eviction only when the table is
