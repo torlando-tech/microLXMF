@@ -27,6 +27,7 @@
 #include <dirent.h>
 #include <errno.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -672,7 +673,11 @@ static void test_cull_to_hot_with_archive() {
     Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xBB);
 
     // Save 75 messages — exceeds HOT_MESSAGES_PER_CONVERSATION (50) by 25.
-    const int total = 75;
+    // Enough to force culling (> HOT) but never past the hard cap, so this
+    // test measures tiering rather than eviction. Derived from the compiled-in
+    // limits: a consumer may set them small enough that a literal would make
+    // the assertions below unsatisfiable.
+    const int total = (int)std::min<size_t>(75, MAX_MESSAGES_PER_CONVERSATION);
     for (int i = 0; i < total; ++i) {
         std::string content = "msg-" + std::to_string(i);
         LXMessage m = make_test_message(dest_hash, src_hash,
@@ -748,7 +753,7 @@ static void test_cull_without_archive_deletes() {
     Bytes dest_hash; for (int i = 0; i < 16; ++i) dest_hash.append((uint8_t)0xAA);
     Bytes src_hash;  for (int i = 0; i < 16; ++i) src_hash.append((uint8_t)0xCC);
 
-    const int total = 60;
+    const int total = (int)std::min<size_t>(60, MAX_MESSAGES_PER_CONVERSATION);
     for (int i = 0; i < total; ++i) {
         LXMessage m = make_test_message(dest_hash, src_hash,
                                         1700000000.0 + i,
