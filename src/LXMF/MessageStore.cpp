@@ -1292,6 +1292,31 @@ std::vector<Bytes> MessageStore::get_messages_for_conversation(const Bytes& peer
 	return std::vector<Bytes>();
 }
 
+// Get last message hash for conversation. Returns the tail of the
+// chronological hash array — the most recently saved message, and the
+// value the conversation list preview wants. O(1) in-memory lookup, no
+// filesystem I/O and no hash-array copy. The tail is always the newest
+// message (save appends), and cull/eviction only remove from the front,
+// so the tail's payload always stays in the hot tier (a single read for
+// load_message_metadata). Returns empty when the conversation doesn't
+// exist or has no messages.
+Bytes MessageStore::get_last_message_hash(const Bytes& peer_hash) const {
+	const ConversationSlot* slot = find_conversation(peer_hash);
+	if (!slot || slot->info.message_count == 0) {
+		return Bytes();
+	}
+	return slot->info.message_hash_bytes(slot->info.message_count - 1);
+}
+
+// Get unread count for one conversation
+size_t MessageStore::get_conversation_unread_count(const Bytes& peer_hash) const {
+	const ConversationSlot* slot = find_conversation(peer_hash);
+	if (slot) {
+		return slot->info.unread_count;
+	}
+	return 0;
+}
+
 // Mark conversation as read
 void MessageStore::mark_conversation_read(const Bytes& peer_hash) {
 	ConversationSlot* slot = find_conversation(peer_hash);

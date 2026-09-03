@@ -310,6 +310,26 @@ namespace LXMF {
 		std::vector<RNS::Bytes> get_messages_for_conversation(const RNS::Bytes& peer_hash);
 
 		/**
+		 * @brief Get the last message hash for a conversation
+		 *
+		 * Returns the hash cached in the conversation index (maintained by
+		 * save_message / delete_message / cull). Empty Bytes if the
+		 * conversation doesn't exist or is empty. O(1), no filesystem I/O.
+		 *
+		 * @param peer_hash Hash of the peer
+		 * @return Last message hash (empty if none)
+		 */
+		RNS::Bytes get_last_message_hash(const RNS::Bytes& peer_hash) const;
+
+		/**
+		 * @brief Get the unread message count for one conversation
+		 *
+		 * @param peer_hash Hash of the peer
+		 * @return Unread count (0 if the conversation doesn't exist)
+		 */
+		size_t get_conversation_unread_count(const RNS::Bytes& peer_hash) const;
+
+		/**
 		 * @brief Mark all messages in conversation as read
 		 *
 		 * @param peer_hash Hash of the peer
