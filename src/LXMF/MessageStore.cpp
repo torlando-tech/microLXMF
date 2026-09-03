@@ -1177,6 +1177,54 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 	}
 }
 
+std::string MessageStore::load_message_content(const Bytes& message_hash) {
+	if (!_initialized) {
+		return std::string();
+	}
+	std::string content;
+	try {
+		std::string message_path = get_message_path(message_hash);
+
+		Bytes data;
+		size_t extension_pos = message_path.rfind('.');
+		std::string backup_path = message_path.substr(0, extension_pos) + ".bak";
+		if (Utilities::OS::file_exists(backup_path.c_str())) {
+			recover_message_payload(message_path, message_hash);
+		}
+		size_t n_read = Utilities::OS::read_file(message_path.c_str(), data);
+		if (n_read == 0 && recover_message_payload(message_path, message_hash)) {
+			n_read = Utilities::OS::read_file(message_path.c_str(), data);
+		}
+		if (n_read == 0 && recover_archived_message_payload(message_hash)) {
+			std::string arch_path = get_archive_message_path(message_hash);
+			n_read = read_archive_file(arch_path.c_str(), data);
+		}
+		if (n_read == 0) {
+			return content;
+		}
+
+		// Read only the "hash" + "content" fields (filter skips the large
+		// "packed" blob) and return the full stored content, uncapped.
+		JsonDocument filter;
+		filter["hash"] = true;
+		filter["content"] = true;
+		_json_doc.clear();
+		DeserializationError error = deserializeJson(_json_doc, data.data(), data.size(),
+		                                             DeserializationOption::Filter(filter));
+		if (error) {
+			return content;
+		}
+		const char* stored_hash = _json_doc["hash"];
+		if (!stored_hash || message_hash.toHex() != stored_hash) return content;
+		if (_json_doc["content"].is<const char*>()) {
+			content = _json_doc["content"].as<std::string>();
+		}
+	} catch (...) {
+		return content;
+	}
+	return content;
+}
+
 bool MessageStore::update_archived_message_state(
     const Bytes& message_hash, Type::Message::State state) {
 	std::string path = get_archive_message_path(message_hash);

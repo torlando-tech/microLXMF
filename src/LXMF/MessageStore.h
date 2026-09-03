@@ -301,10 +301,22 @@ namespace LXMF {
 		/**
 		 * @brief Load a message from storage
 		 *
-		 * @param message_hash Hash of the message to load
+		 * @param message_hash Hash of the message
 		 * @return LXMessage object (or empty if not found)
 		 */
 		LXMessage load_message(const RNS::Bytes& message_hash);
+
+		/**
+		 * @brief Load the FULL stored text content of a message
+		 *
+		 * Reads the UTF-8 "content" field straight from the JSON store file
+		 * (no msgpack unpacking), uncapped. This is what the rare
+		 * full-message view (long-press a bubble) needs: the chat list path
+		 * uses load_message_metadata(), whose cached copy is capped at the
+		 * display limit, so a >600-char message's full view must come from
+		 * disk. Empty string if the message or its content is not found.
+		 */
+		std::string load_message_content(const RNS::Bytes& message_hash);
 
 		/**
 		 * @brief Load only message metadata (fast path for chat list)

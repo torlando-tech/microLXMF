@@ -377,6 +377,18 @@ static void test_long_content_truncation_contract() {
         EXPECT_TRUE(second.content.size() == cap, "cached content capped");
         EXPECT_TRUE(second.content == long_content.substr(0, cap),
                     "cached content is the capped prefix");
+
+        // load_message_content() is the rare full-view path: it bypasses
+        // the (capped) metadata cache and returns the FULL stored content
+        // even after the metadata read has warmed the cache.
+        std::string full = store.load_message_content(m.hash());
+        EXPECT_TRUE(full.size() == long_content.size(),
+                    "full view returns uncapped content after cache warm");
+        EXPECT_TRUE(full == long_content, "full view content is exact");
+
+        // Unknown hash: empty string, no crash.
+        std::string missing = store.load_message_content(peer_hash(0x99));
+        EXPECT_TRUE(missing.empty(), "unknown hash returns empty");
     }
     RNS::Utilities::OS::deregister_filesystem();
     rmrf(root);
