@@ -72,6 +72,18 @@ namespace LXMF {
 		// every cold start until the peer re-announces.
 		static constexpr size_t MAX_DISPLAY_NAME_LEN = 47;  // 47 + nul = 48
 
+		// Cached preview of the conversation's last message. The
+		// conversation list shows the last 30 chars of the newest message;
+		// without this cache every list refresh opens + JSON-parses the
+		// newest message file per conversation (LittleFS open + read +
+		// deserialize dominate the load path on SPI flash). The cache is
+		// written when the last message is stored, persisted in the
+		// conversation index, and cleared whenever the last message is
+		// replaced (delete, hard-cap eviction, out-of-order save). Empty
+		// means "no cached preview" and callers fall back to reading the
+		// message file (old index generations, empty-content messages).
+		static constexpr size_t MAX_LAST_PREVIEW_LEN = 47;  // 47 + nul = 48
+
 		struct ConversationInfo {
 			// Fixed arrays eliminate ~6KB Bytes metadata overhead per conversation
 			// (256 messages × 24 bytes metadata = 6.1KB saved per conversation)
@@ -82,6 +94,11 @@ namespace LXMF {
 			size_t unread_count = 0;           // Number of unread messages
 			uint8_t last_message_hash[MESSAGE_HASH_SIZE];
 			char display_name[MAX_DISPLAY_NAME_LEN + 1] = {0};  // Last seen, nul-terminated
+			// Preview of the last message's content (first 47 chars), kept in
+			// sync with last_message_hash. Empty when last_message_hash is
+			// unset, when the last message has no content, or when the index
+			// generation predates the field (load leaves it empty).
+			char last_preview[MAX_LAST_PREVIEW_LEN + 1] = {0};
 
 			// Helper methods for accessing fixed arrays as Bytes
 			RNS::Bytes peer_hash_bytes() const { return RNS::Bytes(peer_hash, PEER_HASH_SIZE); }
@@ -328,6 +345,38 @@ namespace LXMF {
 		 * @return Unread count (0 if the conversation doesn't exist)
 		 */
 		size_t get_conversation_unread_count(const RNS::Bytes& peer_hash) const;
+
+		/**
+		 * @brief Get the cached preview of a conversation's last message
+		 *
+		 * Returns the first MAX_LAST_PREVIEW_LEN chars of the newest
+		 * message's content (plus its timestamp) from the in-memory
+		 * conversation index. O(1), no filesystem I/O — this is what the
+		 * conversation list needs and it removes one LittleFS open + read
+		 * + JSON parse per conversation from every list refresh.
+		 *
+		 * Returns false (and leaves outputs untouched) when there is no
+		 * cached preview: no conversation, no last message, empty message
+		 * content, or an index generation that predates the field.
+		 * Callers fall back to load_message_metadata() in that case.
+		 *
+		 * @param peer_hash Hash of the peer
+		 * @param out_preview Receives the cached preview (nul-terminated)
+		 * @param out_timestamp Receives the last message's timestamp
+		 * @return True when a cached preview is available
+		 */
+		bool get_last_message_preview(const RNS::Bytes& peer_hash,
+		                              std::string& out_preview,
+		                              double& out_timestamp) const;
+
+		/**
+		 * @brief Set (or clear, when preview is empty) the cached preview
+		 *
+		 * Maintained automatically by save_message / delete_message;
+		 * exposed for tests. Does NOT commit the index.
+		 */
+		void set_last_message_preview(const RNS::Bytes& peer_hash,
+		                              const std::string& preview);
 
 		/**
 		 * @brief Mark all messages in conversation as read

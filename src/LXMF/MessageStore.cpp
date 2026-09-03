@@ -64,6 +64,7 @@ void MessageStore::ConversationInfo::clear() {
 	unread_count = 0;
 	memset(last_message_hash, 0, MESSAGE_HASH_SIZE);
 	memset(display_name, 0, sizeof(display_name));
+	memset(last_preview, 0, sizeof(last_preview));
 }
 
 // ConversationSlot helper method
@@ -262,6 +263,19 @@ bool MessageStore::load_index_file(const std::string& index_path) {
 				}
 			}
 
+			// Restore the cached last-message preview. Optional field:
+			// index generations written before the field exists leave the
+			// cache empty, and the first list refresh falls back to
+			// reading the newest message file (which re-pops the cache on
+			// the next save).
+			if (!conv["last_preview"].isNull()) {
+				const char* lp = conv["last_preview"];
+				if (lp) {
+					strncpy(slot.info.last_preview, lp, MAX_LAST_PREVIEW_LEN);
+					slot.info.last_preview[MAX_LAST_PREVIEW_LEN] = '\0';
+				}
+			}
+
 			++slot_index;
 		}
 
@@ -308,6 +322,13 @@ bool MessageStore::save_index(bool empty) {
 			// reboots — see load_index for the rationale.
 			if (info.display_name[0] != '\0') {
 				conv["display_name"] = info.display_name;
+			}
+
+			// Persist the last-message preview the same way: cold-boot
+			// conversation lists read it straight out of the index instead
+			// of opening + parsing every newest message file.
+			if (info.last_preview[0] != '\0') {
+				conv["last_preview"] = info.last_preview;
 			}
 
 			// Serialize message hashes
@@ -560,6 +581,20 @@ bool MessageStore::save_message(const LXMessage& message) {
 			} else {
 				conv.last_activity = message.timestamp();
 				conv.set_last_message_hash(message.hash());
+
+				// Cache the preview so conversation-list refreshes don't need
+				// to open + parse the newest message file (see
+				// get_last_message_preview). The first MAX_LAST_PREVIEW_LEN
+				// bytes of the content are what the list shows.
+				const RNS::Bytes& content = message.content();
+				if (content.size() > 0) {
+					memset(conv.last_preview, 0, sizeof(conv.last_preview));
+					strncpy(conv.last_preview,
+					        (const char*)content.data(),
+					        MAX_LAST_PREVIEW_LEN);
+				} else {
+					conv.last_preview[0] = '\0';  // no content -> stale, fall back
+				}
 
 				// Increment unread count for incoming messages
 				if (message.incoming()) {
@@ -1213,6 +1248,13 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 				} else {
 					memset(conv.last_message_hash, 0, MESSAGE_HASH_SIZE);
 				}
+				// The cached preview belongs to the deleted message.
+				// Clearing it forces the next list refresh to read the new
+				// tail via load_message_metadata (one-time I/O per
+				// deleted-tail conversation, then the cache re-pops on the
+				// next save). Re-reading the new tail's content here would
+				// add an I/O path to deletion for a one-time benefit.
+				memset(conv.last_preview, 0, sizeof(conv.last_preview));
 			}
 
 			DEBUG("  Removed from conversation");
@@ -1315,6 +1357,38 @@ size_t MessageStore::get_conversation_unread_count(const Bytes& peer_hash) const
 		return slot->info.unread_count;
 	}
 	return 0;
+}
+
+// Get cached last-message preview for one conversation. O(1) in-memory
+// lookup, no filesystem I/O — see the header for the fallback contract.
+bool MessageStore::get_last_message_preview(const Bytes& peer_hash,
+                                            std::string& out_preview,
+                                            double& out_timestamp) const {
+	const ConversationSlot* slot = find_conversation(peer_hash);
+	if (!slot || slot->info.message_count == 0) {
+		return false;
+	}
+	if (slot->info.last_preview[0] == '\0') {
+		return false;
+	}
+	out_preview = slot->info.last_preview;
+	out_timestamp = slot->info.last_activity;
+	return true;
+}
+
+// Set (or clear) the cached last-message preview for a conversation.
+// Maintained by save_message / delete_message; does not commit the index.
+void MessageStore::set_last_message_preview(const Bytes& peer_hash,
+                                            const std::string& preview) {
+	ConversationSlot* slot = find_conversation(peer_hash);
+	if (!slot) {
+		return;
+	}
+	memset(slot->info.last_preview, 0, sizeof(slot->info.last_preview));
+	if (!preview.empty()) {
+		strncpy(slot->info.last_preview, preview.c_str(), MAX_LAST_PREVIEW_LEN);
+	}
+	slot->info.last_preview[MAX_LAST_PREVIEW_LEN] = '\0';
 }
 
 // Mark conversation as read
