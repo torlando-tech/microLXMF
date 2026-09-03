@@ -395,6 +395,21 @@ namespace LXMF {
 		                              const std::string& preview);
 
 		/**
+		 * @brief Persist the in-memory conversation index to disk
+		 *
+		 * Public commit point for callers that mutate the in-memory index
+		 * through the cache accessors (e.g. set_last_message_preview from
+		 * a fallback warm-up) and want the change to survive reboot
+		 * without triggering a message save/delete of their own. Rewrites
+		 * the whole index file atomically. Does NOT take any additional
+		 * state; callers are responsible for not racing concurrent store
+		 * writers (the UI drains this out-of-lock, like mark-read).
+		 *
+		 * @return True if the index was written successfully
+		 */
+		bool commit_index();
+
+		/**
 		 * @brief Mark all messages in conversation as read
 		 *
 		 * @param peer_hash Hash of the peer

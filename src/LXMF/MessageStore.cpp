@@ -1413,6 +1413,12 @@ void MessageStore::set_last_message_preview(const Bytes& peer_hash,
 	slot->info.preview_valid = true;
 }
 
+// Public commit point for callers that mutated the in-memory index via
+// the cache accessors (see the header).
+bool MessageStore::commit_index() {
+	return save_index();
+}
+
 // Mark conversation as read
 void MessageStore::mark_conversation_read(const Bytes& peer_hash) {
 	ConversationSlot* slot = find_conversation(peer_hash);
