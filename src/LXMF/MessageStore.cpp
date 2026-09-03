@@ -151,8 +151,9 @@ void meta_cache_init() {
 	if (meta_cache) {
 		return;  // already allocated (constructor ran once)
 	}
-	meta_cache = (MetadataCacheSlot*)psram_malloc(
-	    sizeof(MetadataCacheSlot) * MessageStore::MESSAGE_METADATA_CACHE_ENTRIES);
+	meta_cache = (MetadataCacheSlot*)heap_caps_malloc(
+	    sizeof(MetadataCacheSlot) * MessageStore::MESSAGE_METADATA_CACHE_ENTRIES,
+	    MALLOC_CAP_SPIRAM);
 	if (meta_cache) {
 		memset(meta_cache, 0,
 		       sizeof(MetadataCacheSlot) * MessageStore::MESSAGE_METADATA_CACHE_ENTRIES);
