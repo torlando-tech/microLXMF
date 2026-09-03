@@ -102,6 +102,73 @@ MessageStore::~MessageStore() {
 	TRACE("MessageStore destroyed");
 }
 
+// ----- Message metadata cache (see MessageStore.h MESSAGE_METADATA_CACHE_*) -----
+// File scope in an anonymous namespace: process-lifetime, so reopening a
+// conversation (or paging older messages) does not re-read message files
+// from SPI flash. The ~41 KiB table is static, not per-MessageStore-
+// instance, and stays outside the class so it is not visible (or
+// allocatable) from headers.
+namespace {
+
+struct MetadataCacheSlot {
+	bool in_use = false;
+	uint8_t hash[LXMF::MESSAGE_HASH_SIZE];
+	char content[MessageStore::MESSAGE_METADATA_MAX_CONTENT + 1];
+	double timestamp = 0.0;
+	bool incoming = false;
+	int state = 0;
+};
+
+MetadataCacheSlot meta_cache[MessageStore::MESSAGE_METADATA_CACHE_ENTRIES];
+size_t meta_cache_next = 0;  // FIFO eviction pointer
+
+bool meta_cache_find(const RNS::Bytes& hash, MetadataCacheSlot** slot) {
+	for (size_t i = 0; i < MessageStore::MESSAGE_METADATA_CACHE_ENTRIES; ++i) {
+		if (meta_cache[i].in_use &&
+		    memcmp(meta_cache[i].hash, hash.data(),
+		           LXMF::MESSAGE_HASH_SIZE) == 0) {
+			*slot = &meta_cache[i];
+			return true;
+		}
+	}
+	*slot = nullptr;
+	return false;
+}
+
+void meta_cache_insert(const RNS::Bytes& hash, const std::string& content,
+                       double timestamp, bool incoming, int state) {
+	MetadataCacheSlot* slot = nullptr;
+	if (!meta_cache_find(hash, &slot)) {
+		// First-fit free slot; FIFO eviction only when the table is
+		// full (50 displayed + a few background fills can never fill
+		// 64 slots, so an open conversation's rows are not evicted).
+		for (size_t i = 0; i < MessageStore::MESSAGE_METADATA_CACHE_ENTRIES; ++i) {
+			if (!meta_cache[i].in_use) {
+				slot = &meta_cache[i];
+				break;
+			}
+		}
+		if (!slot) {
+			slot = &meta_cache[meta_cache_next];
+			meta_cache_next =
+			    (meta_cache_next + 1) %
+			    MessageStore::MESSAGE_METADATA_CACHE_ENTRIES;
+		}
+	}
+	memset(slot, 0, sizeof(*slot));
+	memcpy(slot->hash, hash.data(), LXMF::MESSAGE_HASH_SIZE);
+	size_t n = content.size();
+	if (n > MessageStore::MESSAGE_METADATA_MAX_CONTENT) n = MessageStore::MESSAGE_METADATA_MAX_CONTENT;
+	memcpy(slot->content, content.data(), n);
+	slot->content[n] = '\0';
+	slot->timestamp = timestamp;
+	slot->incoming = incoming;
+	slot->state = state;
+	slot->in_use = true;
+}
+
+}  // namespace
+
 // Initialize storage directories
 bool MessageStore::initialize_storage() {
 	// Create short directories for SPIFFS compatibility
@@ -1027,6 +1094,21 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 		return meta;
 	}
 
+	// Cache hit: O(1) in-memory, no filesystem I/O. This is the fast path
+	// for reopening a conversation and for background page fills.
+	{
+		MetadataCacheSlot* cached = nullptr;
+		if (meta_cache_find(message_hash, &cached)) {
+			meta.hash = message_hash;
+			meta.content = cached->content;
+			meta.timestamp = cached->timestamp;
+			meta.incoming = cached->incoming;
+			meta.state = cached->state;
+			meta.valid = true;
+			return meta;
+		}
+	}
+
 	std::string message_path = get_message_path(message_hash);
 
 	try {
@@ -1082,6 +1164,11 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 		meta.incoming = _json_doc["incoming"] | true;
 		meta.state = _json_doc["state"] | 0;
 		meta.valid = true;
+
+		// Warm the cache so the next read (reopen, pagination, list
+		// preview) is in-memory. Content is truncated to the display cap.
+		meta_cache_insert(message_hash, meta.content, meta.timestamp,
+		                  meta.incoming, meta.state);
 
 		return meta;
 
@@ -1218,6 +1305,16 @@ bool MessageStore::update_message_state(const Bytes& message_hash, Type::Message
 		}
 		Utilities::OS::remove_file(backup_path.c_str());
 
+		// Keep the metadata cache consistent with the committed file:
+		// delivery/failed state changes are the only mutable field, and
+		// the chat UI reads state from the cache on reopen.
+		{
+			MetadataCacheSlot* cached = nullptr;
+			if (meta_cache_find(message_hash, &cached)) {
+				cached->state = static_cast<int>(state);
+			}
+		}
+
 		INFO("Message state updated to " + std::to_string(static_cast<int>(state)));
 		return true;
 
@@ -1297,8 +1394,23 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 			WARNING("Failed to remove unreferenced archived message file: " + arch_path);
 		}
 	}
+
+	// A deleted hash must not serve a cached entry (the hash is stable
+	// content-addressing, but a fresh save could in theory reuse the slot
+	// only if identical — invalidate to be exact).
+	invalidate_message_metadata(message_hash);
+
 	INFO("Message deleted");
 	return true;
+}
+
+// Drop one message's cached metadata (see header). Linear scan of a
+// bounded table; only delete_message() calls this.
+void MessageStore::invalidate_message_metadata(const Bytes& message_hash) {
+	MetadataCacheSlot* slot = nullptr;
+	if (meta_cache_find(message_hash, &slot)) {
+		memset(slot, 0, sizeof(*slot));
+	}
 }
 
 // Get list of conversations (sorted by last activity)

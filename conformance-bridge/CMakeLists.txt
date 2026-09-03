@@ -292,6 +292,22 @@ target_compile_definitions(test_last_message_preview PRIVATE
     NATIVE=1
 )
 
+# Host-side regression coverage for the process-lifetime message-metadata
+# cache (first-read disk load, O(1) re-reads, per-hash keying, state
+# sync on update_message_state, eviction on delete_message, and the
+# display-cap content truncation contract).
+add_executable(test_message_metadata_cache tests/test_message_metadata_cache.cpp)
+target_include_directories(test_message_metadata_cache PRIVATE src)
+target_link_libraries(test_message_metadata_cache PRIVATE MicroLXMFLib Threads::Threads)
+target_compile_options(test_message_metadata_cache PRIVATE
+    -fexceptions
+    -Wall -Wno-unused-parameter -Wno-missing-field-initializers
+)
+target_compile_definitions(test_message_metadata_cache PRIVATE
+    MICROLXMF_NATIVE=1
+    NATIVE=1
+)
+
 # Pyxis invokes save_message() from LVGL's 8 KiB task. Keep enough headroom
 # for UI, packing, filesystem and C++ frames; v153 regressed to >8 KiB here.
 add_custom_target(check_messagestore_stack

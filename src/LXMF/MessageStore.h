@@ -200,6 +200,36 @@ namespace LXMF {
 			bool valid;  // True if loaded successfully
 		};
 
+		// Bounded in-memory cache of MessageMetadata keyed by message
+		// hash. The chat screen reads every displayed message's metadata
+		// from disk (SPI LittleFS open + read + JSON parse, ~hundreds of
+		// ms each on the T-Deck); without this cache REOPENING the same
+		// conversation pays the full page of reads again every time.
+		// The cache lives for the process lifetime (file-scope static in
+		// the .cpp — MessageStore is a long-lived singleton in Pyxis) so
+		// open/close/open is free.
+		//
+		// Bounded: MESSAGE_METADATA_CACHE_ENTRIES fixed slots with FIFO
+		// eviction of the oldest insertion. No per-call heap allocation
+		// (fragmentation rule: fixed arrays, like ConversationInfo).
+		// Content is stored truncated to MESSAGE_METADATA_MAX_CONTENT —
+		// the chat screen renders at most that many chars per bubble
+		// (its MAX_DISPLAY_CHARS); a longer message still needs a full
+		// load, which only the rare full-message view performs.
+		//
+		// Staleness contract: the chat UI is the only consumer; message
+		// content/timestamp/incoming are immutable once written, and the
+		// state field is kept in sync by update_message_state() (the
+		// delivery/failed callback in main.cpp runs it before the UI
+		// event). Message deletion evicts by hash. Single-threaded
+		// access: all store calls in Pyxis run on the main loop.
+		//
+		// The table itself (MetadataCacheSlot array + FIFO pointer) lives
+		// in the .cpp's anonymous namespace so the ~41 KiB static table
+		// is file-scope, not a per-MessageStore-instance member.
+		static constexpr size_t MESSAGE_METADATA_CACHE_ENTRIES = 64;
+		static constexpr size_t MESSAGE_METADATA_MAX_CONTENT = 600;
+
 	public:
 		/**
 		 * @brief Construct MessageStore
@@ -286,6 +316,14 @@ namespace LXMF {
 		 * @return MessageMetadata struct (check .valid field)
 		 */
 		MessageMetadata load_message_metadata(const RNS::Bytes& message_hash);
+
+		/**
+		 * @brief Invalidate one message's cached metadata
+		 *
+		 * Called by delete_message() so a removed hash cannot serve a
+		 * stale cached entry. Cheap (linear scan of a bounded table).
+		 */
+		void invalidate_message_metadata(const RNS::Bytes& message_hash);
 
 		/**
 		 * @brief Update message state in storage
