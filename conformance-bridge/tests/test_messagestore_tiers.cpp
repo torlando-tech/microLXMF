@@ -817,6 +817,102 @@ static void test_hard_cap_eviction() {
     rmrf(hot_root); rmrf(archive_root);
 }
 
+static void test_last_message_and_unread_accessors() {
+    std::cout << "\n=== test_last_message_and_unread_accessors ===\n";
+
+    std::string hot_root = "/tmp/mstore_accessors_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+
+    test_fs::PrefixedFS hot_fs4(hot_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs4);
+
+    MessageStore store("/lxmf");
+
+    Bytes peer_a; for (int i = 0; i < 16; ++i) peer_a.append((uint8_t)(0x10 + i));
+    Bytes peer_b; for (int i = 0; i < 16; ++i) peer_b.append((uint8_t)(0x20 + i));
+
+    // Unknown peer: empty hash, zero unread.
+    Bytes unknown; for (int i = 0; i < 16; ++i) unknown.append((uint8_t)0xEE);
+    EXPECT_TRUE(store.get_last_message_hash(unknown).size() == 0,
+                "unknown peer returns empty last-message hash");
+    EXPECT_EQ(store.get_conversation_unread_count(unknown), (size_t)0,
+              "unknown peer has zero unread");
+
+    // Incoming messages from peer_a: peer = source, unread increments.
+    for (int i = 0; i < 3; ++i) {
+        LXMessage m = make_test_message(peer_a, peer_a, 1700000000.0 + i,
+                                        "in-" + std::to_string(i), true);
+        EXPECT_TRUE(store.save_message(m), "incoming save ok");
+    }
+    // Outgoing to peer_a: peer = destination, unread must NOT increment.
+    {
+        LXMessage m = make_test_message(peer_a, peer_b, 1700000001.0,
+                                        "out-0", false);
+        EXPECT_TRUE(store.save_message(m), "outgoing save ok");
+    }
+
+    // Last-message hash == the outgoing message's hash (newest, and the
+    // 16-byte source/dest pair in the test maps into the 16-byte peer
+    // space: destination peer_a, so the outgoing message lands in the
+    // same conversation as the incoming ones).
+    {
+        LXMessage m = make_test_message(peer_a, peer_b, 1700000001.0,
+                                        "out-0", false);
+        Bytes last = store.get_last_message_hash(peer_a);
+        EXPECT_TRUE(last.size() > 0, "last-message hash present");
+        EXPECT_TRUE(last == m.hash(), "last-message hash is the newest message");
+    }
+    EXPECT_EQ(store.get_conversation_unread_count(peer_a), (size_t)3,
+              "unread counts only incoming messages");
+
+    // mark_conversation_read clears the count.
+    store.mark_conversation_read(peer_a);
+    EXPECT_EQ(store.get_conversation_unread_count(peer_a), (size_t)0,
+              "mark_conversation_read clears unread");
+
+    // get_conversations() orders by last activity — newest peer first.
+    {
+        LXMessage m = make_test_message(peer_b, peer_b, 1700000100.0, "b1", true);
+        EXPECT_TRUE(store.save_message(m), "peer_b save ok");
+    }
+    {
+        auto convs = store.get_conversations();
+        EXPECT_EQ((int)convs.size(), 2, "two conversations");
+        EXPECT_TRUE(convs.size() >= 1 && convs[0] == peer_b,
+                    "most-recent conversation first");
+        EXPECT_TRUE(convs.size() >= 2 && convs[1] == peer_a,
+                    "older conversation second");
+    }
+
+    // Deleting one message updates the cached last hash to the new tail.
+    {
+        LXMessage m = make_test_message(peer_a, peer_a, 1700000200.0,
+                                        "tail-1", true);
+        Bytes newest = m.hash();
+        EXPECT_TRUE(store.save_message(m), "newest incoming save ok");
+        EXPECT_TRUE(store.get_last_message_hash(peer_a) == newest,
+                    "tail tracks newly saved message");
+        store.delete_message(newest);
+        // Tail rewinds to the newest surviving message — the outgoing
+        // one saved earlier (timestamp 1700000001.0).
+        Bytes after_delete = make_test_message(peer_a, peer_b, 1700000001.0,
+                                               "out-0", false).hash();
+        EXPECT_TRUE(store.get_last_message_hash(peer_a) == after_delete,
+                    "tail rewinds to previous message after delete");
+    }
+
+    // Deleting the whole conversation empties both accessors.
+    store.delete_conversation(peer_a);
+    EXPECT_TRUE(store.get_last_message_hash(peer_a).size() == 0,
+                "deleted conversation returns empty last-message hash");
+    EXPECT_EQ(store.get_conversation_unread_count(peer_a), (size_t)0,
+              "deleted conversation has zero unread");
+
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
 int main() {
     std::cout << "MessageStore tier tests\n";
     std::cout << "HOT_MESSAGES_PER_CONVERSATION = "
@@ -837,6 +933,7 @@ int main() {
         test_cull_without_archive_deletes();
         test_cull_to_hot_with_archive();
         test_hard_cap_eviction();
+        test_last_message_and_unread_accessors();
     } catch (const std::exception& e) {
         std::cerr << "FATAL: uncaught exception: " << e.what() << "\n";
         return 2;
