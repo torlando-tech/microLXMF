@@ -64,6 +64,8 @@ void MessageStore::ConversationInfo::clear() {
 	unread_count = 0;
 	memset(last_message_hash, 0, MESSAGE_HASH_SIZE);
 	memset(display_name, 0, sizeof(display_name));
+	memset(last_preview, 0, sizeof(last_preview));
+	preview_valid = false;
 }
 
 // ConversationSlot helper method
@@ -73,12 +75,22 @@ void MessageStore::ConversationSlot::clear() {
 	info.clear();
 }
 
+namespace {
+// Forward declaration (defined below with the cache table): one-time
+// allocation/initialization of the message-metadata cache.
+void meta_cache_init();
+}  // namespace
+
 // Constructor
 MessageStore::MessageStore(const std::string& base_path) :
 	_base_path(base_path),
 	_initialized(false)
 {
 	INFO("Initializing MessageStore at: " + _base_path);
+
+	// One-time PSRAM allocation for the metadata cache (ESP32); no-op
+	// on the host build. Runs before any load can touch the table.
+	meta_cache_init();
 
 	// Initialize pool
 	for (size_t i = 0; i < MAX_CONVERSATIONS; ++i) {
@@ -98,6 +110,128 @@ MessageStore::~MessageStore() {
 		save_index();
 	}
 	TRACE("MessageStore destroyed");
+}
+
+// ----- Message metadata cache (see MessageStore.h MESSAGE_METADATA_CACHE_*) -----
+// File scope in an anonymous namespace: process-lifetime, so reopening a
+// conversation (or paging older messages) does not re-read message files
+// from SPI flash. The ~41 KiB table lives outside the class so it is not
+// visible (or allocatable) from headers.
+//
+// Placement: on ESP32 (ARDUINO) the table is allocated from PSRAM in
+// meta_cache_init() — a static .bss table would consume 41 KiB of internal
+// DRAM, which is tight enough to fail the LVGL task's 8 KiB stack
+// allocation at boot (observed: "Failed to create LVGL task" with the
+// table in .bss). PSRAM has multi-MB headroom and the cache is a pure
+// speed feature: if the allocation fails, meta_cache stays null and every
+// load_message_metadata() falls back to a disk read (pre-cache behavior).
+// The host conformance build (no ARDUINO) uses the static table.
+namespace {
+
+struct MetadataCacheSlot {
+	bool in_use = false;
+	uint8_t hash[LXMF::MESSAGE_HASH_SIZE];
+	char content[MessageStore::MESSAGE_METADATA_MAX_CONTENT + 1];
+	size_t content_len = 0;  // exact byte length — content may hold NULs
+	double timestamp = 0.0;
+	bool incoming = false;
+	int state = 0;
+};
+
+#ifdef ARDUINO
+#include <esp_heap_caps.h>
+MetadataCacheSlot* meta_cache = nullptr;  // PSRAM, set by meta_cache_init()
+#else
+static MetadataCacheSlot meta_cache_static[MessageStore::MESSAGE_METADATA_CACHE_ENTRIES];
+MetadataCacheSlot* meta_cache = meta_cache_static;
+#endif
+size_t meta_cache_next = 0;  // FIFO eviction pointer
+
+void meta_cache_init() {
+#ifdef ARDUINO
+	if (meta_cache) {
+		return;  // already allocated (constructor ran once)
+	}
+	meta_cache = (MetadataCacheSlot*)heap_caps_malloc(
+	    sizeof(MetadataCacheSlot) * MessageStore::MESSAGE_METADATA_CACHE_ENTRIES,
+	    MALLOC_CAP_SPIRAM);
+	if (meta_cache) {
+		memset(meta_cache, 0,
+		       sizeof(MetadataCacheSlot) * MessageStore::MESSAGE_METADATA_CACHE_ENTRIES);
+		INFO("MessageStore: metadata cache in PSRAM (" +
+		     std::to_string(sizeof(MetadataCacheSlot) *
+				    MessageStore::MESSAGE_METADATA_CACHE_ENTRIES) +
+		     " bytes)");
+	} else {
+		WARNING("MessageStore: metadata cache disabled (PSRAM allocation failed)");
+	}
+#else
+	// Host build: static table, nothing to initialize.
+#endif
+}
+
+bool meta_cache_find(const RNS::Bytes& hash, MetadataCacheSlot** slot) {
+	*slot = nullptr;
+	if (!meta_cache) {
+		return false;  // cache disabled (allocation failed) -> disk read
+	}
+	for (size_t i = 0; i < MessageStore::MESSAGE_METADATA_CACHE_ENTRIES; ++i) {
+		if (meta_cache[i].in_use &&
+		    memcmp(meta_cache[i].hash, hash.data(),
+		           LXMF::MESSAGE_HASH_SIZE) == 0) {
+			*slot = &meta_cache[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+void meta_cache_insert(const RNS::Bytes& hash, const std::string& content,
+                       double timestamp, bool incoming, int state) {
+	if (!meta_cache) {
+		return;  // cache disabled -> nothing to warm
+	}
+	MetadataCacheSlot* slot = nullptr;
+	if (!meta_cache_find(hash, &slot)) {
+		// First-fit free slot; FIFO eviction only when the table is
+		// full (50 displayed + a few background fills can never fill
+		// 64 slots, so an open conversation's rows are not evicted).
+		for (size_t i = 0; i < MessageStore::MESSAGE_METADATA_CACHE_ENTRIES; ++i) {
+			if (!meta_cache[i].in_use) {
+				slot = &meta_cache[i];
+				break;
+			}
+		}
+		if (!slot) {
+			slot = &meta_cache[meta_cache_next];
+			meta_cache_next =
+			    (meta_cache_next + 1) %
+			    MessageStore::MESSAGE_METADATA_CACHE_ENTRIES;
+		}
+	}
+	memset(slot, 0, sizeof(*slot));
+	memcpy(slot->hash, hash.data(), LXMF::MESSAGE_HASH_SIZE);
+	size_t n = content.size();
+	if (n > MessageStore::MESSAGE_METADATA_MAX_CONTENT) n = MessageStore::MESSAGE_METADATA_MAX_CONTENT;
+	memcpy(slot->content, content.data(), n);
+	slot->content[n] = '\0';
+	slot->content_len = n;
+	slot->timestamp = timestamp;
+	slot->incoming = incoming;
+	slot->state = state;
+	slot->in_use = true;
+}
+
+}  // namespace
+
+// Defined below; delete_conversation() and clear_all() invalidate cached
+// metadata while walking their payload lists, so keep the definition
+// before its first use.
+void MessageStore::invalidate_message_metadata(const RNS::Bytes& message_hash) {
+	MetadataCacheSlot* slot = nullptr;
+	if (meta_cache_find(message_hash, &slot)) {
+		memset(slot, 0, sizeof(*slot));
+	}
 }
 
 // Initialize storage directories
@@ -262,6 +396,22 @@ bool MessageStore::load_index_file(const std::string& index_path) {
 				}
 			}
 
+			// Restore the cached last-message preview. Both fields are
+			// optional: index generations written before they exist leave
+			// the cache unpopulated, and the first list refresh falls back
+			// to reading the newest message file (which re-pops the cache
+			// and, via the caller's deferred commit, persists it).
+			if (!conv["last_preview"].isNull()) {
+				const char* lp = conv["last_preview"];
+				if (lp) {
+					strncpy(slot.info.last_preview, lp, MAX_LAST_PREVIEW_LEN);
+					slot.info.last_preview[MAX_LAST_PREVIEW_LEN] = '\0';
+				}
+			}
+			if (!conv["preview_valid"].isNull()) {
+				slot.info.preview_valid = conv["preview_valid"].as<bool>();
+			}
+
 			++slot_index;
 		}
 
@@ -308,6 +458,17 @@ bool MessageStore::save_index(bool empty) {
 			// reboots — see load_index for the rationale.
 			if (info.display_name[0] != '\0') {
 				conv["display_name"] = info.display_name;
+			}
+
+			// Persist the last-message preview the same way: cold-boot
+			// conversation lists read it straight out of the index instead
+			// of opening + parsing every newest message file. The
+			// preview_valid flag is persisted even when the preview is
+			// empty (empty-content tail): an unpopulated cache must
+			// re-fall-back on the next boot, a cached empty one must not.
+			if (info.preview_valid) {
+				conv["last_preview"] = info.last_preview;
+				conv["preview_valid"] = true;
 			}
 
 			// Serialize message hashes
@@ -560,6 +721,23 @@ bool MessageStore::save_message(const LXMessage& message) {
 			} else {
 				conv.last_activity = message.timestamp();
 				conv.set_last_message_hash(message.hash());
+
+				// Cache the preview so conversation-list refreshes don't
+				// need to open + parse the newest message file (see
+				// get_last_message_preview). The first
+				// MAX_LAST_PREVIEW_LEN bytes of the content are what the
+				// list shows. An empty-content message caches an EMPTY
+				// preview with preview_valid=true — "I already know the
+				// tail is empty" — so the list never re-reads it.
+				const RNS::Bytes& content = message.content();
+				// Bounded memcpy: content() is a Bytes, NOT nul-terminated —
+				// strncpy would over-read past the buffer.
+				memset(conv.last_preview, 0, sizeof(conv.last_preview));
+				size_t n = content.size();
+				if (n > MAX_LAST_PREVIEW_LEN) n = MAX_LAST_PREVIEW_LEN;
+				memcpy(conv.last_preview, content.data(), n);
+				conv.last_preview[n] = '\0';
+				conv.preview_valid = true;
 
 				// Increment unread count for incoming messages
 				if (message.incoming()) {
@@ -981,6 +1159,22 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 		return meta;
 	}
 
+	// Cache hit: O(1) in-memory, no filesystem I/O. This is the fast path
+	// for reopening a conversation and for background page fills.
+	{
+		MetadataCacheSlot* cached = nullptr;
+		if (meta_cache_find(message_hash, &cached)) {
+			meta.hash = message_hash;
+			// Length-constructed: content may contain embedded NULs.
+			meta.content = std::string(cached->content, cached->content_len);
+			meta.timestamp = cached->timestamp;
+			meta.incoming = cached->incoming;
+			meta.state = cached->state;
+			meta.valid = true;
+			return meta;
+		}
+	}
+
 	std::string message_path = get_message_path(message_hash);
 
 	try {
@@ -1031,17 +1225,79 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 		// Read pre-extracted fields (no msgpack unpacking needed)
 		if (_json_doc["content"].is<const char*>()) {
 			meta.content = _json_doc["content"].as<std::string>();
+			// Uniform contract: metadata content is ALWAYS the capped
+			// display preview (cache hit or cold disk read). The full
+			// stored content is served exclusively by
+			// load_message_content(), so callers cannot observe a
+			// warm/cold difference in what load_message_metadata()
+			// returns.
+			if (meta.content.size() > MESSAGE_METADATA_MAX_CONTENT) {
+				meta.content.resize(MESSAGE_METADATA_MAX_CONTENT);
+			}
 		}
 		meta.timestamp = _json_doc["timestamp"] | 0.0;
 		meta.incoming = _json_doc["incoming"] | true;
 		meta.state = _json_doc["state"] | 0;
 		meta.valid = true;
 
+		// Warm the cache so the next read (reopen, pagination, list
+		// preview) is in-memory. Content is truncated to the display cap.
+		meta_cache_insert(message_hash, meta.content, meta.timestamp,
+		                  meta.incoming, meta.state);
+
 		return meta;
 
 	} catch (...) {
 		return meta;
 	}
+}
+
+std::string MessageStore::load_message_content(const Bytes& message_hash) {
+	if (!_initialized) {
+		return std::string();
+	}
+	std::string content;
+	try {
+		std::string message_path = get_message_path(message_hash);
+
+		Bytes data;
+		size_t extension_pos = message_path.rfind('.');
+		std::string backup_path = message_path.substr(0, extension_pos) + ".bak";
+		if (Utilities::OS::file_exists(backup_path.c_str())) {
+			recover_message_payload(message_path, message_hash);
+		}
+		size_t n_read = Utilities::OS::read_file(message_path.c_str(), data);
+		if (n_read == 0 && recover_message_payload(message_path, message_hash)) {
+			n_read = Utilities::OS::read_file(message_path.c_str(), data);
+		}
+		if (n_read == 0 && recover_archived_message_payload(message_hash)) {
+			std::string arch_path = get_archive_message_path(message_hash);
+			n_read = read_archive_file(arch_path.c_str(), data);
+		}
+		if (n_read == 0) {
+			return content;
+		}
+
+		// Read only the "hash" + "content" fields (filter skips the large
+		// "packed" blob) and return the full stored content, uncapped.
+		JsonDocument filter;
+		filter["hash"] = true;
+		filter["content"] = true;
+		_json_doc.clear();
+		DeserializationError error = deserializeJson(_json_doc, data.data(), data.size(),
+		                                             DeserializationOption::Filter(filter));
+		if (error) {
+			return content;
+		}
+		const char* stored_hash = _json_doc["hash"];
+		if (!stored_hash || message_hash.toHex() != stored_hash) return content;
+		if (_json_doc["content"].is<const char*>()) {
+			content = _json_doc["content"].as<std::string>();
+		}
+	} catch (...) {
+		return content;
+	}
+	return content;
 }
 
 bool MessageStore::update_archived_message_state(
@@ -1091,6 +1347,16 @@ bool MessageStore::update_archived_message_state(
 		return false;
 	}
 	_archive_fs.remove(backup.c_str());
+	// Same cache sync as the hot path in update_message_state(): a cached
+	// entry must not keep serving the pre-archive state after the
+	// archived record has moved on (delayed delivery / failure updates
+	// would otherwise stay invisible until FIFO eviction).
+	{
+		MetadataCacheSlot* cached = nullptr;
+		if (meta_cache_find(message_hash, &cached)) {
+			cached->state = static_cast<int>(state);
+		}
+	}
 	return true;
 }
 
@@ -1172,6 +1438,16 @@ bool MessageStore::update_message_state(const Bytes& message_hash, Type::Message
 		}
 		Utilities::OS::remove_file(backup_path.c_str());
 
+		// Keep the metadata cache consistent with the committed file:
+		// delivery/failed state changes are the only mutable field, and
+		// the chat UI reads state from the cache on reopen.
+		{
+			MetadataCacheSlot* cached = nullptr;
+			if (meta_cache_find(message_hash, &cached)) {
+				cached->state = static_cast<int>(state);
+			}
+		}
+
 		INFO("Message state updated to " + std::to_string(static_cast<int>(state)));
 		return true;
 
@@ -1213,6 +1489,15 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 				} else {
 					memset(conv.last_message_hash, 0, MESSAGE_HASH_SIZE);
 				}
+				// The cached preview belongs to the deleted message.
+				// Clearing it (preview_valid=false) forces the next list
+				// refresh to read the new tail via load_message_metadata
+				// (one-time I/O per deleted-tail conversation, then the cache
+				// re-pops — empty-content tails included). Re-reading the new
+				// tail's content here would add an I/O path to deletion for a
+				// one-time benefit.
+				memset(conv.last_preview, 0, sizeof(conv.last_preview));
+				conv.preview_valid = false;
 			}
 
 			DEBUG("  Removed from conversation");
@@ -1242,6 +1527,12 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 			WARNING("Failed to remove unreferenced archived message file: " + arch_path);
 		}
 	}
+
+	// A deleted hash must not serve a cached entry (the hash is stable
+	// content-addressing, but a fresh save could in theory reuse the slot
+	// only if identical — invalidate to be exact).
+	invalidate_message_metadata(message_hash);
+
 	INFO("Message deleted");
 	return true;
 }
@@ -1317,6 +1608,53 @@ size_t MessageStore::get_conversation_unread_count(const Bytes& peer_hash) const
 	return 0;
 }
 
+// Get cached last-message preview for one conversation. O(1) in-memory
+// lookup, no filesystem I/O — see the header for the fallback contract.
+// Note: returning true with an EMPTY out_preview is valid — it means the
+// tail is a cached empty-content message.
+bool MessageStore::get_last_message_preview(const Bytes& peer_hash,
+                                            std::string& out_preview,
+                                            double& out_timestamp) const {
+	const ConversationSlot* slot = find_conversation(peer_hash);
+	if (!slot || slot->info.message_count == 0) {
+		return false;
+	}
+	if (!slot->info.preview_valid) {
+		return false;
+	}
+	out_preview = slot->info.last_preview;
+	out_timestamp = slot->info.last_activity;
+	return true;
+}
+
+// Set (or clear) the cached last-message preview for a conversation.
+// An empty preview is a valid cached state (empty-content tail) and is
+// marked populated; callers only fall back to the file when the cache is
+// unpopulated (preview_valid=false). Maintained by save_message /
+// delete_message and by callers warming the cache from a fallback read;
+// does not commit the index.
+void MessageStore::set_last_message_preview(const Bytes& peer_hash,
+                                            const std::string& preview) {
+	ConversationSlot* slot = find_conversation(peer_hash);
+	if (!slot) {
+		return;
+	}
+	// Always clear first: the new preview may be shorter (or empty) than
+	// the previous one, and a stale tail would leak into it.
+	memset(slot->info.last_preview, 0, sizeof(slot->info.last_preview));
+	if (!preview.empty()) {
+		strncpy(slot->info.last_preview, preview.c_str(), MAX_LAST_PREVIEW_LEN);
+	}
+	slot->info.last_preview[MAX_LAST_PREVIEW_LEN] = '\0';
+	slot->info.preview_valid = true;
+}
+
+// Public commit point for callers that mutated the in-memory index via
+// the cache accessors (see the header).
+bool MessageStore::commit_index() {
+	return save_index();
+}
+
 // Mark conversation as read
 void MessageStore::mark_conversation_read(const Bytes& peer_hash) {
 	ConversationSlot* slot = find_conversation(peer_hash);
@@ -1352,6 +1690,9 @@ bool MessageStore::delete_conversation(const Bytes& peer_hash) {
 	// Delete all now-unreferenced message files from BOTH hot and archive.
 	for (size_t i = 0; i < _transaction_snapshot.message_count; ++i) {
 		Bytes msg_hash = _transaction_snapshot.message_hash_bytes(i);
+		// A deleted message must not keep serving valid cached metadata
+		// to a caller that retained its hash.
+		invalidate_message_metadata(msg_hash);
 		std::string message_path = get_message_path(msg_hash);
 		if (Utilities::OS::file_exists(message_path.c_str())) {
 			if (!Utilities::OS::remove_file(message_path.c_str())) {
@@ -1418,6 +1759,9 @@ bool MessageStore::clear_all() {
 			continue;
 		}
 		for (size_t j = 0; j < slot.info.message_count; ++j) {
+			// Same as delete_conversation(): dropped payloads must not
+			// keep serving valid cached metadata by hash.
+			invalidate_message_metadata(slot.info.message_hash_bytes(j));
 			std::string message_path = get_message_path(slot.info.message_hash_bytes(j));
 			if (Utilities::OS::file_exists(message_path.c_str())) {
 				if (!Utilities::OS::remove_file(message_path.c_str())) {

@@ -113,6 +113,23 @@ namespace LXMF {
 		// every cold start until the peer re-announces.
 		static constexpr size_t MAX_DISPLAY_NAME_LEN = 47;  // 47 + nul = 48
 
+		// Cached preview of the conversation's last message. The
+		// conversation list shows the last 30 chars of the newest message;
+		// without this cache every list refresh opens + JSON-parses the
+		// newest message file per conversation (LittleFS open + read +
+		// deserialize dominate the load path on SPI flash). The cache is
+		// written when the last message is stored, persisted in the
+		// conversation index, and cleared whenever the last message is
+		// replaced (delete, hard-cap eviction, out-of-order save).
+		// preview_valid is the "cache is populated" signal (NOT a non-empty
+		// string): empty-content messages (location shares, blank pings)
+		// also get cached — as an empty preview with preview_valid=true —
+		// so callers never re-read the message file for a tail they have
+		// already seen. preview_valid=false means "no cached preview" and
+		// callers fall back to reading the message file (old index
+		// generations, or the one-shot warm-up after a delete/clear).
+		static constexpr size_t MAX_LAST_PREVIEW_LEN = 47;  // 47 + nul = 48
+
 		struct ConversationInfo {
 			// Fixed arrays eliminate ~6KB Bytes metadata overhead per conversation
 			// (256 messages × 24 bytes metadata = 6.1KB saved per conversation)
@@ -123,6 +140,15 @@ namespace LXMF {
 			size_t unread_count = 0;           // Number of unread messages
 			uint8_t last_message_hash[MESSAGE_HASH_SIZE];
 			char display_name[MAX_DISPLAY_NAME_LEN + 1] = {0};  // Last seen, nul-terminated
+			// Preview of the last message's content (first 47 chars), kept in
+			// sync with last_message_hash. preview_valid=true means the
+			// preview reflects the current last message — including an
+			// empty string for empty-content messages. preview_valid=false
+			// (default, after clear()/delete/cull, or when the index
+			// generation predates the field) means callers must fall back
+			// to reading the message file.
+			char last_preview[MAX_LAST_PREVIEW_LEN + 1] = {0};
+			bool preview_valid = false;
 
 			// Helper methods for accessing fixed arrays as Bytes
 			RNS::Bytes peer_hash_bytes() const { return RNS::Bytes(peer_hash, PEER_HASH_SIZE); }
@@ -215,6 +241,38 @@ namespace LXMF {
 			bool valid;  // True if loaded successfully
 		};
 
+		// Bounded in-memory cache of MessageMetadata keyed by message
+		// hash. The chat screen reads every displayed message's metadata
+		// from disk (SPI LittleFS open + read + JSON parse, ~hundreds of
+		// ms each on the T-Deck); without this cache REOPENING the same
+		// conversation pays the full page of reads again every time.
+		// The cache lives for the process lifetime (file-scope static in
+		// the .cpp — MessageStore is a long-lived singleton in Pyxis) so
+		// open/close/open is free.
+		//
+		// Bounded: MESSAGE_METADATA_CACHE_ENTRIES fixed slots with FIFO
+		// eviction of the oldest insertion. No per-call heap allocation
+		// (fragmentation rule: fixed arrays, like ConversationInfo).
+		// Content is stored truncated to MESSAGE_METADATA_MAX_CONTENT —
+		// the chat screen renders at most that many chars per bubble
+		// (its MAX_DISPLAY_CHARS); a longer message still needs a full
+		// load, which only the rare full-message view performs.
+		//
+		// Uniform staleness contract: the chat UI is the only consumer;
+		// message content/timestamp/incoming are immutable once written, and
+		// the state field is kept in sync by update_message_state() on BOTH
+		// the hot and archived branches (the delivery/failed callback in
+		// main.cpp runs it before the UI event). Deletion of a message,
+		// conversation, or the whole store evicts the affected slots by
+		// hash. Single-threaded access: all store calls in Pyxis run on
+		// the main loop.
+		//
+		// The table itself (MetadataCacheSlot array + FIFO pointer) lives
+		// in the .cpp's anonymous namespace so the ~41 KiB static table
+		// is file-scope, not a per-MessageStore-instance member.
+		static constexpr size_t MESSAGE_METADATA_CACHE_ENTRIES = 64;
+		static constexpr size_t MESSAGE_METADATA_MAX_CONTENT = 600;
+
 	public:
 		/**
 		 * @brief Construct MessageStore
@@ -286,10 +344,22 @@ namespace LXMF {
 		/**
 		 * @brief Load a message from storage
 		 *
-		 * @param message_hash Hash of the message to load
+		 * @param message_hash Hash of the message
 		 * @return LXMessage object (or empty if not found)
 		 */
 		LXMessage load_message(const RNS::Bytes& message_hash);
+
+		/**
+		 * @brief Load the FULL stored text content of a message
+		 *
+		 * Reads the UTF-8 "content" field straight from the JSON store file
+		 * (no msgpack unpacking), uncapped. This is what the rare
+		 * full-message view (long-press a bubble) needs: the chat list path
+		 * uses load_message_metadata(), whose cached copy is capped at the
+		 * display limit, so a >600-char message's full view must come from
+		 * disk. Empty string if the message or its content is not found.
+		 */
+		std::string load_message_content(const RNS::Bytes& message_hash);
 
 		/**
 		 * @brief Load only message metadata (fast path for chat list)
@@ -297,10 +367,23 @@ namespace LXMF {
 		 * Reads content/timestamp/state directly from JSON without msgpack unpacking.
 		 * Much faster than load_message() for displaying message lists.
 		 *
+		 * Content contract: ALWAYS the capped display preview (at most
+		 * MESSAGE_METADATA_MAX_CONTENT bytes), identical on a cache hit
+		 * and on a cold disk read. For the full stored content use
+		 * load_message_content().
+		 *
 		 * @param message_hash Hash of the message to load
 		 * @return MessageMetadata struct (check .valid field)
 		 */
 		MessageMetadata load_message_metadata(const RNS::Bytes& message_hash);
+
+		/**
+		 * @brief Invalidate one message's cached metadata
+		 *
+		 * Called by delete_message() so a removed hash cannot serve a
+		 * stale cached entry. Cheap (linear scan of a bounded table).
+		 */
+		void invalidate_message_metadata(const RNS::Bytes& message_hash);
 
 		/**
 		 * @brief Update message state in storage
@@ -369,6 +452,60 @@ namespace LXMF {
 		 * @return Unread count (0 if the conversation doesn't exist)
 		 */
 		size_t get_conversation_unread_count(const RNS::Bytes& peer_hash) const;
+
+		/**
+		 * @brief Get the cached preview of a conversation's last message
+		 *
+		 * Returns the first MAX_LAST_PREVIEW_LEN chars of the newest
+		 * message's content (plus its timestamp) from the in-memory
+		 * conversation index. O(1), no filesystem I/O — this is what the
+		 * conversation list needs and it removes one LittleFS open + read
+		 * + JSON parse per conversation from every list refresh.
+		 *
+		 * out_preview may be empty: that is a legitimate cached preview
+		 * for an empty-content last message (location share, blank ping).
+		 * Returns false (and leaves outputs untouched) only when no
+		 * cached preview exists: no conversation, no last message, or the
+		 * cache is unpopulated (old index generation, or a tail replaced
+		 * since the last cache write). Callers fall back to
+		 * load_message_metadata() in that case and should re-pop the
+		 * cache with set_last_message_preview().
+		 *
+		 * @param peer_hash Hash of the peer
+		 * @param out_preview Receives the cached preview (may be empty)
+		 * @param out_timestamp Receives the last message's timestamp
+		 * @return True when a cached preview is available
+		 */
+		bool get_last_message_preview(const RNS::Bytes& peer_hash,
+		                              std::string& out_preview,
+		                              double& out_timestamp) const;
+
+		/**
+		 * @brief Set (or clear, when preview is empty) the cached preview
+		 *
+		 * An empty preview is a valid cached state: it marks the current
+		 * empty-content tail as "already read" so callers do not re-read
+		 * the message file on every refresh. Maintained automatically by
+		 * save_message / delete_message; also used by callers that
+		 * warm the cache from a fallback read. Does NOT commit the index.
+		 */
+		void set_last_message_preview(const RNS::Bytes& peer_hash,
+		                              const std::string& preview);
+
+		/**
+		 * @brief Persist the in-memory conversation index to disk
+		 *
+		 * Public commit point for callers that mutate the in-memory index
+		 * through the cache accessors (e.g. set_last_message_preview from
+		 * a fallback warm-up) and want the change to survive reboot
+		 * without triggering a message save/delete of their own. Rewrites
+		 * the whole index file atomically. Does NOT take any additional
+		 * state; callers are responsible for not racing concurrent store
+		 * writers (the UI drains this out-of-lock, like mark-read).
+		 *
+		 * @return True if the index was written successfully
+		 */
+		bool commit_index();
 
 		/**
 		 * @brief Mark all messages in conversation as read

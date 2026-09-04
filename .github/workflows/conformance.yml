@@ -102,11 +102,13 @@ jobs:
         working-directory: microLXMF/conformance-bridge
         run: |
           cmake -S . -B build -G Ninja
-          cmake --build build --target microLXMFBridge test_announced_stamp_cost test_outbound_admission test_runtime_outbound_admission test_messagestore_tiers --parallel
+          cmake --build build --target microLXMFBridge test_announced_stamp_cost test_outbound_admission test_runtime_outbound_admission test_messagestore_tiers test_last_message_preview test_message_metadata_cache --parallel
           ./build/test_announced_stamp_cost
           ./build/test_outbound_admission
           ./build/test_runtime_outbound_admission
           ./build/test_messagestore_tiers
+          ./build/test_last_message_preview
+          ./build/test_message_metadata_cache
 
       - name: Smoke-test bridge binary
         # Sanity check before running pytest: bridge starts, prints
