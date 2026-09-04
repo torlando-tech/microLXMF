@@ -217,12 +217,14 @@ namespace LXMF {
 		// (its MAX_DISPLAY_CHARS); a longer message still needs a full
 		// load, which only the rare full-message view performs.
 		//
-		// Staleness contract: the chat UI is the only consumer; message
-		// content/timestamp/incoming are immutable once written, and the
-		// state field is kept in sync by update_message_state() (the
-		// delivery/failed callback in main.cpp runs it before the UI
-		// event). Message deletion evicts by hash. Single-threaded
-		// access: all store calls in Pyxis run on the main loop.
+		// Uniform staleness contract: the chat UI is the only consumer;
+		// message content/timestamp/incoming are immutable once written, and
+		// the state field is kept in sync by update_message_state() on BOTH
+		// the hot and archived branches (the delivery/failed callback in
+		// main.cpp runs it before the UI event). Deletion of a message,
+		// conversation, or the whole store evicts the affected slots by
+		// hash. Single-threaded access: all store calls in Pyxis run on
+		// the main loop.
 		//
 		// The table itself (MetadataCacheSlot array + FIFO pointer) lives
 		// in the .cpp's anonymous namespace so the ~41 KiB static table
@@ -323,6 +325,11 @@ namespace LXMF {
 		 *
 		 * Reads content/timestamp/state directly from JSON without msgpack unpacking.
 		 * Much faster than load_message() for displaying message lists.
+		 *
+		 * Content contract: ALWAYS the capped display preview (at most
+		 * MESSAGE_METADATA_MAX_CONTENT bytes), identical on a cache hit
+		 * and on a cold disk read. For the full stored content use
+		 * load_message_content().
 		 *
 		 * @param message_hash Hash of the message to load
 		 * @return MessageMetadata struct (check .valid field)

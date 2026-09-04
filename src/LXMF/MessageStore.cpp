@@ -132,6 +132,7 @@ struct MetadataCacheSlot {
 	bool in_use = false;
 	uint8_t hash[LXMF::MESSAGE_HASH_SIZE];
 	char content[MessageStore::MESSAGE_METADATA_MAX_CONTENT + 1];
+	size_t content_len = 0;  // exact byte length — content may hold NULs
 	double timestamp = 0.0;
 	bool incoming = false;
 	int state = 0;
@@ -214,6 +215,7 @@ void meta_cache_insert(const RNS::Bytes& hash, const std::string& content,
 	if (n > MessageStore::MESSAGE_METADATA_MAX_CONTENT) n = MessageStore::MESSAGE_METADATA_MAX_CONTENT;
 	memcpy(slot->content, content.data(), n);
 	slot->content[n] = '\0';
+	slot->content_len = n;
 	slot->timestamp = timestamp;
 	slot->incoming = incoming;
 	slot->state = state;
@@ -221,6 +223,16 @@ void meta_cache_insert(const RNS::Bytes& hash, const std::string& content,
 }
 
 }  // namespace
+
+// Defined below; delete_conversation() and clear_all() invalidate cached
+// metadata while walking their payload lists, so keep the definition
+// before its first use.
+void MessageStore::invalidate_message_metadata(const RNS::Bytes& message_hash) {
+	MetadataCacheSlot* slot = nullptr;
+	if (meta_cache_find(message_hash, &slot)) {
+		memset(slot, 0, sizeof(*slot));
+	}
+}
 
 // Initialize storage directories
 bool MessageStore::initialize_storage() {
@@ -1153,7 +1165,8 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 		MetadataCacheSlot* cached = nullptr;
 		if (meta_cache_find(message_hash, &cached)) {
 			meta.hash = message_hash;
-			meta.content = cached->content;
+			// Length-constructed: content may contain embedded NULs.
+			meta.content = std::string(cached->content, cached->content_len);
 			meta.timestamp = cached->timestamp;
 			meta.incoming = cached->incoming;
 			meta.state = cached->state;
@@ -1212,6 +1225,15 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 		// Read pre-extracted fields (no msgpack unpacking needed)
 		if (_json_doc["content"].is<const char*>()) {
 			meta.content = _json_doc["content"].as<std::string>();
+			// Uniform contract: metadata content is ALWAYS the capped
+			// display preview (cache hit or cold disk read). The full
+			// stored content is served exclusively by
+			// load_message_content(), so callers cannot observe a
+			// warm/cold difference in what load_message_metadata()
+			// returns.
+			if (meta.content.size() > MESSAGE_METADATA_MAX_CONTENT) {
+				meta.content.resize(MESSAGE_METADATA_MAX_CONTENT);
+			}
 		}
 		meta.timestamp = _json_doc["timestamp"] | 0.0;
 		meta.incoming = _json_doc["incoming"] | true;
@@ -1325,6 +1347,16 @@ bool MessageStore::update_archived_message_state(
 		return false;
 	}
 	_archive_fs.remove(backup.c_str());
+	// Same cache sync as the hot path in update_message_state(): a cached
+	// entry must not keep serving the pre-archive state after the
+	// archived record has moved on (delayed delivery / failure updates
+	// would otherwise stay invisible until FIFO eviction).
+	{
+		MetadataCacheSlot* cached = nullptr;
+		if (meta_cache_find(message_hash, &cached)) {
+			cached->state = static_cast<int>(state);
+		}
+	}
 	return true;
 }
 
@@ -1505,15 +1537,6 @@ bool MessageStore::delete_message(const Bytes& message_hash) {
 	return true;
 }
 
-// Drop one message's cached metadata (see header). Linear scan of a
-// bounded table; only delete_message() calls this.
-void MessageStore::invalidate_message_metadata(const Bytes& message_hash) {
-	MetadataCacheSlot* slot = nullptr;
-	if (meta_cache_find(message_hash, &slot)) {
-		memset(slot, 0, sizeof(*slot));
-	}
-}
-
 // Get list of conversations (sorted by last activity)
 std::vector<Bytes> MessageStore::get_conversations() {
 	std::vector<std::pair<double, Bytes>> sorted;
@@ -1667,6 +1690,9 @@ bool MessageStore::delete_conversation(const Bytes& peer_hash) {
 	// Delete all now-unreferenced message files from BOTH hot and archive.
 	for (size_t i = 0; i < _transaction_snapshot.message_count; ++i) {
 		Bytes msg_hash = _transaction_snapshot.message_hash_bytes(i);
+		// A deleted message must not keep serving valid cached metadata
+		// to a caller that retained its hash.
+		invalidate_message_metadata(msg_hash);
 		std::string message_path = get_message_path(msg_hash);
 		if (Utilities::OS::file_exists(message_path.c_str())) {
 			if (!Utilities::OS::remove_file(message_path.c_str())) {
@@ -1733,6 +1759,9 @@ bool MessageStore::clear_all() {
 			continue;
 		}
 		for (size_t j = 0; j < slot.info.message_count; ++j) {
+			// Same as delete_conversation(): dropped payloads must not
+			// keep serving valid cached metadata by hash.
+			invalidate_message_metadata(slot.info.message_hash_bytes(j));
 			std::string message_path = get_message_path(slot.info.message_hash_bytes(j));
 			if (Utilities::OS::file_exists(message_path.c_str())) {
 				if (!Utilities::OS::remove_file(message_path.c_str())) {

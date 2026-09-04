@@ -365,15 +365,19 @@ static void test_long_content_truncation_contract() {
 
         MessageStore::MessageMetadata first = store.load_message_metadata(m.hash());
         EXPECT_TRUE(first.valid, "first read valid");
-        EXPECT_TRUE(first.content.size() == long_content.size(),
-                    "first read has FULL content");
+        // Uniform contract (warm or cold): metadata content is ALWAYS the
+        // capped display preview. The pre-fix first read returned the FULL
+        // 1500-byte content, so callers observing warm vs cold reads saw
+        // different lengths for the same hash.
+        const size_t cap = MessageStore::MESSAGE_METADATA_MAX_CONTENT;
+        EXPECT_TRUE(first.content.size() == cap,
+                    "cold read capped at display cap");
+        EXPECT_TRUE(first.content == long_content.substr(0, cap),
+                    "cold read is the capped prefix");
 
-        // Cached reads are capped at the display cap (the chat UI renders
-        // at most that many chars per bubble; full content is only needed
-        // by the explicit full-message view, which is a rare action).
+        // Cached reads return exactly the same preview.
         MessageStore::MessageMetadata second = store.load_message_metadata(m.hash());
         EXPECT_TRUE(second.valid, "cached read valid");
-        const size_t cap = MessageStore::MESSAGE_METADATA_MAX_CONTENT;
         EXPECT_TRUE(second.content.size() == cap, "cached content capped");
         EXPECT_TRUE(second.content == long_content.substr(0, cap),
                     "cached content is the capped prefix");
@@ -424,6 +428,94 @@ static void test_persistence_across_reconstruction() {
     rmrf(root);
 }
 
+static void test_archived_state_update_syncs_cache() {
+    std::cout << "\n=== test_archived_state_update_syncs_cache ===\n";
+    std::string root = "/tmp/mstore_meta_cache_test7";
+    std::string arch_root = "/tmp/mstore_meta_cache_test7_arch";
+    rmrf(root);
+    rmrf(arch_root);
+    ::mkdir(root.c_str(), 0755);
+    ::mkdir(arch_root.c_str(), 0755);
+    meta_fs::PrefixedFS hot_fs(root);
+    meta_fs::PrefixedFS arch_fs(arch_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+
+    Bytes peer = peer_hash(0x77), self = self_hash();
+    {
+        MessageStore store("/lxmf");
+        store.set_archive_filesystem(arch_fs, "/arch");
+        LXMessage m = make_message(peer, self, 1700000000.0, "arch sync", true);
+        EXPECT_TRUE(store.save_message(m), "save");
+        EXPECT_TRUE(store.load_message_metadata(m.hash()).valid, "warm cache");
+
+        // Move the payload to the archive the way eviction does, so
+        // update_message_state() takes the archived branch.
+        std::string hot = root + "/m/" + m.hash().toHex().substr(0, 12) + ".j";
+        std::string arch = arch_root + "/arch/m/" + m.hash().toHex().substr(0, 12) + ".j";
+        ::mkdir((arch_root + "/arch/m").c_str(), 0755);
+        EXPECT_TRUE(::rename(hot.c_str(), arch.c_str()) == 0, "move to archive");
+
+        // The archived branch must sync the shared cache too — otherwise
+        // the cached entry keeps serving the old state until eviction.
+        EXPECT_TRUE(store.update_message_state(m.hash(),
+                    LXMF::Type::Message::DELIVERED), "archived state update");
+        MessageStore::MessageMetadata meta = store.load_message_metadata(m.hash());
+        EXPECT_TRUE(meta.valid, "re-read valid");
+        EXPECT_TRUE(meta.state == static_cast<int>(LXMF::Type::Message::DELIVERED),
+                    "archived state update visible in cache");
+        EXPECT_TRUE(meta.content == "arch sync", "content intact");
+    }
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(root);
+    rmrf(arch_root);
+}
+
+static void test_bulk_delete_invalidates_cache() {
+    std::cout << "\n=== test_bulk_delete_invalidates_cache ===\n";
+    std::string root = "/tmp/mstore_meta_cache_test8";
+    rmrf(root);
+    ::mkdir(root.c_str(), 0755);
+    meta_fs::PrefixedFS hot_fs(root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+
+    Bytes peer = peer_hash(0x88), self = self_hash();
+    {
+        MessageStore store("/lxmf");
+        LXMessage m1 = make_message(peer, self, 1700000001.0, "bulk one", true);
+        LXMessage m2 = make_message(peer, self, 1700000002.0, "bulk two", true);
+        EXPECT_TRUE(store.save_message(m1), "save 1");
+        EXPECT_TRUE(store.save_message(m2), "save 2");
+        EXPECT_TRUE(store.load_message_metadata(m1.hash()).valid, "warm 1");
+        EXPECT_TRUE(store.load_message_metadata(m2.hash()).valid, "warm 2");
+
+        // delete_conversation() drops payloads in bulk; neither hash may
+        // keep serving cached metadata afterward.
+        EXPECT_TRUE(store.delete_conversation(peer), "delete conversation");
+        EXPECT_TRUE(!store.load_message_metadata(m1.hash()).valid,
+                    "m1 not served after bulk delete");
+        EXPECT_TRUE(!store.load_message_metadata(m2.hash()).valid,
+                    "m2 not served after bulk delete");
+    }
+    // clear_all() covers the same class for the wipe path.
+    {
+        MessageStore store("/lxmf");
+        LXMessage m1 = make_message(peer, self, 1700000003.0, "wipe one", true);
+        LXMessage m2 = make_message(peer, self, 1700000004.0, "wipe two", true);
+        EXPECT_TRUE(store.save_message(m1), "save 1");
+        EXPECT_TRUE(store.save_message(m2), "save 2");
+        EXPECT_TRUE(store.load_message_metadata(m1.hash()).valid, "warm 1");
+        EXPECT_TRUE(store.load_message_metadata(m2.hash()).valid, "warm 2");
+
+        EXPECT_TRUE(store.clear_all(), "clear all");
+        EXPECT_TRUE(!store.load_message_metadata(m1.hash()).valid,
+                    "m1 not served after clear_all");
+        EXPECT_TRUE(!store.load_message_metadata(m2.hash()).valid,
+                    "m2 not served after clear_all");
+    }
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(root);
+}
+
 int main() {
     std::cout << "MessageStore metadata cache tests\n";
     try {
@@ -433,6 +525,8 @@ int main() {
         test_delete_evicts_cache();
         test_long_content_truncation_contract();
         test_persistence_across_reconstruction();
+        test_archived_state_update_syncs_cache();
+        test_bulk_delete_invalidates_cache();
     } catch (const std::exception& e) {
         std::cerr << "FATAL: uncaught exception: " << e.what() << "\n";
         return 2;
