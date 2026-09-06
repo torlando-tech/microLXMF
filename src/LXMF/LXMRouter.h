@@ -761,6 +761,16 @@ namespace LXMF {
 		float _sync_progress = 0.0f;
 		double _sync_start_time = 0.0;
 		SyncCompleteCallback _sync_complete_callback;
+		// Bounded re-poll for PR_PATH_REQUESTED. Transport::has_path() is a
+		// FileStore index lookup (LittleFS read in the microStore-backed
+		// fork), so polling it every process_sync() call — i.e. every main
+		// loop iteration, ~2s — hammers the same partition as message
+		// storage with a read per pass for the whole duration the
+		// propagation node's path stays missing (the 60s sync timeout
+		// expires without ever giving up on the wait). Re-poll at most
+		// once per PATH_REQUEST_WAIT instead; the path-request timeout
+		// path is unchanged (the 60s sync timeout still bounds the cycle).
+		double _next_sync_path_poll_time = 0.0;
 
 		// Locally delivered transient IDs circular buffer (zero heap fragmentation)
 		// Note: Keep as Bytes for now - converting to static array causes issues

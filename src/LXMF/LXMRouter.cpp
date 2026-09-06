@@ -2104,8 +2104,17 @@ void LXMRouter::process_sync() {
 		return;
 	}
 
-	// PR_PATH_REQUESTED: wait for path, then advance to link establishing
+	// PR_PATH_REQUESTED: wait for path, then advance to link establishing.
+	// Bounded re-poll: Transport::has_path() is a FileStore (LittleFS) read
+	// in the microStore-backed fork, so polling it every process_sync() call
+	// — every main loop iteration, ~2s — hammers the same partition as
+	// message storage for the entire 60s wait window. Re-poll at most once
+	// per PATH_REQUEST_WAIT; the 60s sync timeout still bounds the cycle.
 	if (_sync_state == PR_PATH_REQUESTED) {
+		if (Utilities::OS::time() < _next_sync_path_poll_time) {
+			return;  // Still waiting for the re-poll window
+		}
+		_next_sync_path_poll_time = Utilities::OS::time() + PATH_REQUEST_WAIT;
 		if (!Transport::has_path(prop_node)) {
 			return;  // Still waiting for path
 		}
