@@ -179,6 +179,8 @@ struct RouterRegistrySlot {
 	}
 };
 static RouterRegistrySlot _router_registry_pool[ROUTER_REGISTRY_SIZE];
+// Static router pointer for propagation-sync callbacks.
+static LXMRouter* _active_sync_router = nullptr;
 
 static RouterRegistrySlot* find_router_registry_slot(const Bytes& hash) {
 	for (size_t i = 0; i < ROUTER_REGISTRY_SIZE; i++) {
@@ -607,15 +609,18 @@ LXMRouter::LXMRouter(
 }
 
 LXMRouter::~LXMRouter() {
+	if (_active_sync_router == this) {
+		_active_sync_router = nullptr;
+	}
 	if (_delivery_announce_handler) {
 		Transport::deregister_announce_handler(_delivery_announce_handler);
 		_delivery_announce_handler.reset();
 	}
 
-	// Unregister from global registry
-	RouterRegistrySlot* slot = find_router_registry_slot(_delivery_destination.hash());
-	if (slot) {
-		slot->clear();
+	for (auto& slot : _router_registry_pool) {
+		if (slot.in_use && slot.router == this) {
+			slot.clear();
+		}
 	}
 	TRACE("LXMRouter destroyed");
 }
@@ -1369,8 +1374,10 @@ Link LXMRouter::get_link_for_destination(const Bytes& destination_hash) {
 			if (reg_slot) {
 				reg_slot->in_use = true;
 				reg_slot->set_destination_hash(link_destination.hash());
-				reg_slot->router = this;
 			}
+		}
+		if (reg_slot) {
+			reg_slot->router = this;
 		}
 
 		// Register link callbacks (using static functions)
@@ -1947,9 +1954,6 @@ bool LXMRouter::send_propagated(LXMessage& message) {
 	INFO("  PROPAGATED resource transfer initiated");
 	return true;
 }
-
-// Static router pointer for sync callbacks (raw function pointers required by RequestReceipt)
-static LXMRouter* _active_sync_router = nullptr;
 
 // Static callback wrappers for sync protocol
 static void static_list_response_cb(const RequestReceipt& receipt) {

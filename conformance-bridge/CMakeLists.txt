@@ -370,3 +370,14 @@ target_compile_definitions(test_runtime_outbound_admission PRIVATE
     MICROLXMF_NATIVE=1
     NATIVE=1
 )
+
+# Memory-safety regressions use an in-memory interface and synthetic payloads.
+enable_testing()
+foreach(regression router_lifetime nested_fields metadata_hash_bounds)
+    add_executable(test_${regression} tests/test_${regression}.cpp)
+    target_link_libraries(test_${regression} PRIVATE MicroLXMFLib Threads::Threads)
+    add_test(NAME ${regression} COMMAND test_${regression})
+    set_tests_properties(${regression} PROPERTIES TIMEOUT 30)
+endforeach()
+# A deeply nested field used to exhaust the host stack before signature checks.
+set_tests_properties(nested_fields PROPERTIES TIMEOUT 30)
