@@ -172,6 +172,7 @@ void meta_cache_init() {
 
 bool meta_cache_find(const RNS::Bytes& hash, MetadataCacheSlot** slot) {
 	*slot = nullptr;
+	if (hash.size() != LXMF::MESSAGE_HASH_SIZE) return false;
 	if (!meta_cache) {
 		return false;  // cache disabled (allocation failed) -> disk read
 	}
@@ -188,6 +189,7 @@ bool meta_cache_find(const RNS::Bytes& hash, MetadataCacheSlot** slot) {
 
 void meta_cache_insert(const RNS::Bytes& hash, const std::string& content,
                        double timestamp, bool incoming, int state) {
+	if (hash.size() != LXMF::MESSAGE_HASH_SIZE) return;
 	if (!meta_cache) {
 		return;  // cache disabled -> nothing to warm
 	}

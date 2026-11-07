@@ -372,56 +372,61 @@ LXMessage LXMessage::unpack_from_bytes(const Bytes& lxmf_bytes, Type::Message::M
 			throw std::runtime_error("LXMF fields map has no valid payload offset");
 		}
 
-		// Recursive skip — std::function captures itself for
-		// arbitrarily-nested array/map.
-		std::function<bool(const uint8_t*&, const uint8_t*)> skip;
-		skip = [&skip](const uint8_t*& p, const uint8_t* end) -> bool {
+		constexpr size_t max_field_nesting = 32;
+		std::function<bool(const uint8_t*&, const uint8_t*, size_t)> skip;
+		skip = [&skip](const uint8_t*& p, const uint8_t* end, size_t depth) -> bool {
+			if (depth > max_field_nesting) return false;
 			if (p >= end) return false;
 			uint8_t b = *p++;
 			auto rd = [&](size_t n, uint64_t& out) -> bool {
-				if (p + n > end) return false;
+				if (size_t(end - p) < n) return false;
 				out = 0;
 				for (size_t i = 0; i < n; ++i) out = (out << 8) | *p++;
 				return true;
 			};
+			auto advance = [&](uint64_t n) -> bool {
+				if (n > uint64_t(end - p)) return false;
+				p += size_t(n);
+				return true;
+			};
 			if (b <= 0x7f || b >= 0xe0) return true;                       // fixint
-			if ((b & 0xe0) == 0xa0) { p += (b & 0x1f); return p <= end; }   // fixstr
+			if ((b & 0xe0) == 0xa0) return advance(b & 0x1f);              // fixstr
 			if ((b & 0xf0) == 0x90) {                                       // fixarray
 				size_t n = b & 0x0f;
-				for (size_t i = 0; i < n; ++i) if (!skip(p, end)) return false;
+				for (size_t i = 0; i < n; ++i) if (!skip(p, end, depth + 1)) return false;
 				return true;
 			}
 			if ((b & 0xf0) == 0x80) {                                       // fixmap
 				size_t n = b & 0x0f;
-				for (size_t i = 0; i < 2 * n; ++i) if (!skip(p, end)) return false;
+				for (size_t i = 0; i < 2 * n; ++i) if (!skip(p, end, depth + 1)) return false;
 				return true;
 			}
 			uint64_t len = 0;
 			switch (b) {
 				case 0xc0: case 0xc2: case 0xc3: return true;
-				case 0xc4: if (!rd(1, len)) return false; p += len; return p <= end;
-				case 0xc5: if (!rd(2, len)) return false; p += len; return p <= end;
-				case 0xc6: if (!rd(4, len)) return false; p += len; return p <= end;
-				case 0xca: p += 4; return p <= end;
-				case 0xcb: p += 8; return p <= end;
-				case 0xcc: case 0xd0: p += 1; return p <= end;
-				case 0xcd: case 0xd1: p += 2; return p <= end;
-				case 0xce: case 0xd2: p += 4; return p <= end;
-				case 0xcf: case 0xd3: p += 8; return p <= end;
-				case 0xd9: if (!rd(1, len)) return false; p += len; return p <= end;
-				case 0xda: if (!rd(2, len)) return false; p += len; return p <= end;
-				case 0xdb: if (!rd(4, len)) return false; p += len; return p <= end;
+				case 0xc4: return rd(1, len) && advance(len);
+				case 0xc5: return rd(2, len) && advance(len);
+				case 0xc6: return rd(4, len) && advance(len);
+				case 0xca: return advance(4);
+				case 0xcb: return advance(8);
+				case 0xcc: case 0xd0: return advance(1);
+				case 0xcd: case 0xd1: return advance(2);
+				case 0xce: case 0xd2: return advance(4);
+				case 0xcf: case 0xd3: return advance(8);
+				case 0xd9: return rd(1, len) && advance(len);
+				case 0xda: return rd(2, len) && advance(len);
+				case 0xdb: return rd(4, len) && advance(len);
 				case 0xdc: { if (!rd(2, len)) return false;
-					for (uint64_t i = 0; i < len; ++i) if (!skip(p, end)) return false;
+					for (uint64_t i = 0; i < len; ++i) if (!skip(p, end, depth + 1)) return false;
 					return true; }
 				case 0xdd: { if (!rd(4, len)) return false;
-					for (uint64_t i = 0; i < len; ++i) if (!skip(p, end)) return false;
+					for (uint64_t i = 0; i < len; ++i) if (!skip(p, end, depth + 1)) return false;
 					return true; }
 				case 0xde: { if (!rd(2, len)) return false;
-					for (uint64_t i = 0; i < 2 * len; ++i) if (!skip(p, end)) return false;
+					for (uint64_t i = 0; i < 2 * len; ++i) if (!skip(p, end, depth + 1)) return false;
 					return true; }
 				case 0xdf: { if (!rd(4, len)) return false;
-					for (uint64_t i = 0; i < 2 * len; ++i) if (!skip(p, end)) return false;
+					for (uint64_t i = 0; i < 2 * len; ++i) if (!skip(p, end, depth + 1)) return false;
 					return true; }
 				default: return false;
 			}
@@ -429,10 +434,16 @@ LXMessage LXMessage::unpack_from_bytes(const Bytes& lxmf_bytes, Type::Message::M
 
 		for (size_t i = 0; i < map_size.size() && temp_fields_count < MAX_FIELDS; ++i) {
 			const uint8_t* k_start = fields_p;
-			if (!skip(fields_p, fields_end)) break;
+			if (!skip(fields_p, fields_end, 0)) {
+				WARNING("Rejecting invalid or excessively nested LXMF field key");
+				return LXMessage();
+			}
 			const uint8_t* k_end = fields_p;
 			const uint8_t* v_start = fields_p;
-			if (!skip(fields_p, fields_end)) break;
+			if (!skip(fields_p, fields_end, 0)) {
+				WARNING("Rejecting invalid or excessively nested LXMF field value");
+				return LXMessage();
+			}
 			const uint8_t* v_end = fields_p;
 
 			temp_fields[temp_fields_count].in_use = true;
